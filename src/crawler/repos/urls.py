@@ -157,6 +157,9 @@ class UrlRepository:
                 CrawlUrl.id == url_id,
                 CrawlUrl.claimed_by == worker_id,
                 CrawlUrl.status == UrlStatus.FETCHING,
+                CrawlUrl.job_id.in_(
+                    select(CrawlJob.id).where(CrawlJob.status == JobStatus.RUNNING)
+                ),
             )
             .values(
                 status=UrlStatus.PROCESSING,
@@ -181,6 +184,9 @@ class UrlRepository:
                 CrawlUrl.id == url_id,
                 CrawlUrl.claimed_by == worker_id,
                 CrawlUrl.status == UrlStatus.PROCESSING,
+                CrawlUrl.job_id.in_(
+                    select(CrawlJob.id).where(CrawlJob.status == JobStatus.RUNNING)
+                ),
             )
             .values(
                 status=UrlStatus.DONE,

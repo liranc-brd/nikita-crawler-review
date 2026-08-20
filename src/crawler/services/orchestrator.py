@@ -89,6 +89,9 @@ class CrawlOrchestrator:
             )
             return
 
+        if not await self._jobs.is_running(url_row.job_id):
+            return
+
         if response.status_code == 404:
             await self._mark_permanent_failure(
                 url_id=url_id,
@@ -181,7 +184,7 @@ class CrawlOrchestrator:
             return
 
         try:
-            await self._process_success_response(
+            processed = await self._process_success_response(
                 url_row=url_row,
                 response=response,
                 worker_id=worker_id,
@@ -205,6 +208,9 @@ class CrawlOrchestrator:
             )
             return
 
+        if not processed:
+            return
+
         await self._finish_attempt(
             attempt=attempt,
             result_status="success",
@@ -220,7 +226,10 @@ class CrawlOrchestrator:
         url_row: CrawlUrl,
         response: FetchResponse,
         worker_id: str,
-    ) -> str:
+    ) -> bool:
+        if not await self._jobs.is_running(url_row.job_id):
+            return False
+
         content_type = _content_type_from_headers(response.headers)
         processor = self._processors.processor_for(content_type)
         if not await self._urls.mark_processing(
@@ -229,10 +238,13 @@ class CrawlOrchestrator:
             content_type=content_type,
             http_status_code=response.status_code,
         ):
-            raise RuntimeError("URL ownership was lost before processing")
+            return False
 
         body = response.body or b""
         metadata = processor.extract_metadata(body, response.headers)
+        if not await self._jobs.is_running(url_row.job_id):
+            return False
+
         artifact = await self._storage.persist_artifact(
             job_id=url_row.job_id,
             crawl_url_id=url_row.id,
@@ -241,11 +253,17 @@ class CrawlOrchestrator:
             body=body,
             headers=response.headers,
         )
+        if not await self._jobs.is_running(url_row.job_id):
+            return False
+
         await self._storage.persist_metadata(
             artifact_id=artifact.id,
             metadata_type=processor.metadata_type,
             metadata=metadata,
         )
+        if not await self._jobs.is_running(url_row.job_id):
+            return False
+
         await self.discover_links(
             job_id=url_row.job_id,
             source_url_id=url_row.id,
@@ -257,7 +275,8 @@ class CrawlOrchestrator:
             worker_id=worker_id,
             content_artifact_id=artifact.id,
         ):
-            raise RuntimeError("URL ownership was lost before completion")
+            return False
+        return True
 
     async def discover_links(
         self,
@@ -270,12 +289,20 @@ class CrawlOrchestrator:
         job = await self._jobs.get(job_id)
         if job is None:
             raise RuntimeError("crawl job does not exist")
+        if not await self._jobs.is_running(job.id):
+            return DiscoveryOutcome(
+                enqueued_urls=0,
+                recorded_links=0,
+                spawned_child_jobs=0,
+            )
 
         resolved_links = list(links)
         enqueued_urls = 0
         recorded_links = 0
         spawned_child_jobs = 0
         for link in resolved_links:
+            if not await self._jobs.is_running(job.id):
+                break
             normalized_link = normalize_url(link, base_url=source_url)
             same_hostname = is_same_hostname(job.seed_hostname, normalized_link)
             child_job_id = await self.create_child_job_if_needed(
@@ -314,6 +341,8 @@ class CrawlOrchestrator:
         parent_job: CrawlJob,
         seed_url: str,
     ) -> UUID | None:
+        if not await self._jobs.is_running(parent_job.id):
+            return None
         if not is_same_hostname(parent_job.seed_hostname, seed_url):
             return None
         if not should_spawn_child(seed_url, parent_job.config.get("child_rules", [])):
@@ -356,7 +385,7 @@ class CrawlOrchestrator:
         error_code: str,
         error_detail: str,
         retry_after_seconds: int | None = None,
-    ) -> None:
+    ) -> str:
         attempt_number = url_row.fetch_attempts + 1
         max_attempts = int(job.config.get("max_attempts", 3))
         if attempt_number >= max_attempts:

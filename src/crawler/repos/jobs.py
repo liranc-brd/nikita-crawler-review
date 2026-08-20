@@ -44,6 +44,16 @@ class JobRepository:
     async def get(self, job_id: UUID) -> CrawlJob | None:
         return await self._session.get(CrawlJob, job_id)
 
+    async def is_running(self, job_id: UUID) -> bool:
+        return (
+            await self._session.scalar(
+                select(CrawlJob.id).where(
+                    CrawlJob.id == job_id,
+                    CrawlJob.status == JobStatus.RUNNING,
+                )
+            )
+        ) is not None
+
     async def create_job(
         self,
         *,

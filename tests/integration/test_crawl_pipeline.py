@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,7 @@ class CrawlTestContainer:
     seed_url_id: UUID
     fetch_response: dict[str, Any]
     fetch_call_count: dict[str, int]
+    after_fetch: list[Callable[[], Awaitable[None]]]
 
 
 @pytest.fixture
@@ -117,10 +118,13 @@ async def app_container(
         ),
     }
     fetch_call_count = {"value": 0}
+    after_fetch: list[Callable[[], Awaitable[None]]] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         fetch_call_count["value"] += 1
         assert request.url.params == httpx.QueryParams({"url": seed.normalized_url})
+        for action in after_fetch:
+            await action()
         return httpx.Response(200, json=fetch_response)
 
     async with httpx.AsyncClient(
@@ -146,6 +150,7 @@ async def app_container(
             seed_url_id=seed.id,
             fetch_response=fetch_response,
             fetch_call_count=fetch_call_count,
+            after_fetch=after_fetch,
         )
 
 
@@ -416,3 +421,42 @@ async def test_non_running_job_does_not_process_claimed_url(
     assert app_container.fetch_call_count["value"] == 0
     assert artifact is None
     assert attempt is None
+
+
+@pytest.mark.anyio
+async def test_stopped_job_after_fetch_does_not_persist_or_discover(
+    app_container: CrawlTestContainer,
+) -> None:
+    async def pause_job_after_fetch() -> None:
+        parent_job = await app_container.async_session.get(
+            CrawlJob, app_container.parent_job_id
+        )
+        assert parent_job is not None
+        parent_job.status = JobStatus.PAUSED
+        await app_container.async_session.flush()
+
+    app_container.after_fetch.append(pause_job_after_fetch)
+
+    await app_container.orchestrator.process_url(
+        url_id=app_container.seed_url_id,
+        worker_id="worker-a",
+    )
+
+    crawl_url = await app_container.async_session.get(CrawlUrl, app_container.seed_url_id)
+    artifact = await app_container.async_session.scalar(
+        select(ContentArtifact).where(ContentArtifact.crawl_url_id == app_container.seed_url_id)
+    )
+    attempt = await app_container.async_session.scalar(
+        select(CrawlAttempt).where(CrawlAttempt.crawl_url_id == app_container.seed_url_id)
+    )
+    metadata = await app_container.async_session.scalar(select(ContentMetadata))
+    discoveries = list((await app_container.async_session.scalars(select(DiscoveredLink))).all())
+
+    assert crawl_url is not None
+    assert crawl_url.status is UrlStatus.FETCHING
+    assert artifact is None
+    assert attempt is not None
+    assert attempt.result_status == "in_progress"
+    assert attempt.finished_at is None
+    assert metadata is None
+    assert discoveries == []
