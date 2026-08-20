@@ -13,6 +13,7 @@ from crawler.db.models.enums import UrlStatus
 class CrawlUrl(Base):
     __tablename__ = "crawl_urls"
     __table_args__ = (
+        UniqueConstraint("id", "job_id", name="uq_crawl_urls_id_job_id"),
         UniqueConstraint("job_id", "normalized_url", name="uq_crawl_urls_job_id_normalized_url"),
     )
 
