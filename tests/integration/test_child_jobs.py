@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from sqlalchemy import select
 
+from crawler.db.models.enums import JobStatus
 from crawler.db.models.jobs import CrawlJob
 from crawler.db.models.urls import CrawlUrl
 from crawler.repos.jobs import JobRepository
@@ -41,6 +42,9 @@ async def test_matching_rule_spawns_child_job_and_skips_parent_enqueuing(
     )
     assert child_job_id is not None
     app_container.async_session.info["task6_job_ids"].add(child_job_id)
+    child_job = await app_container.async_session.get(CrawlJob, child_job_id)
+    assert child_job is not None
+    assert child_job.status is JobStatus.RUNNING
     assert await app_container.url_repo.exists_in_job(
         app_container.parent_job_id,
         f"https://{parent_job.seed_hostname}/products/42",

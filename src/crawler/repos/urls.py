@@ -117,22 +117,31 @@ class UrlRepository:
         await self._session.flush()
         return result.scalar_one_or_none() is not None
 
-    async def mark_fetching(self, *, url_id: UUID, worker_id: str) -> CrawlUrl:
+    async def get_claimed_url(self, *, url_id: UUID, worker_id: str) -> CrawlUrl | None:
+        return await self._session.scalar(
+            select(CrawlUrl).where(
+                CrawlUrl.id == url_id,
+                CrawlUrl.claimed_by == worker_id,
+                CrawlUrl.status == UrlStatus.CLAIMED,
+            )
+        )
+
+    async def mark_fetching(self, *, url_id: UUID, worker_id: str) -> CrawlUrl | None:
         result = await self._session.execute(
             update(CrawlUrl)
             .where(
                 CrawlUrl.id == url_id,
                 CrawlUrl.claimed_by == worker_id,
                 CrawlUrl.status == UrlStatus.CLAIMED,
+                CrawlUrl.job_id.in_(
+                    select(CrawlJob.id).where(CrawlJob.status == JobStatus.RUNNING)
+                ),
             )
             .values(status=UrlStatus.FETCHING, started_at=_utcnow())
             .returning(CrawlUrl)
         )
         await self._session.flush()
-        crawl_url = result.scalar_one_or_none()
-        if crawl_url is None:
-            raise RuntimeError("URL is not claimed by this worker")
-        return crawl_url
+        return result.scalar_one_or_none()
 
     async def mark_processing(
         self,

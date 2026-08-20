@@ -9,8 +9,11 @@ from bs4 import BeautifulSoup
 
 from crawler.domain.retry_policy import compute_next_retry_at
 from crawler.domain.url_policy import is_same_hostname, normalize_url, should_spawn_child
+from crawler.db.models.attempts import CrawlAttempt
+from crawler.db.models.enums import JobStatus, UrlStatus
 from crawler.db.models.jobs import CrawlJob
 from crawler.db.models.urls import CrawlUrl
+from crawler.repos.attempts import AttemptRepository
 from crawler.repos.discoveries import DiscoveryRepository
 from crawler.repos.jobs import JobRepository
 from crawler.repos.urls import UrlRepository
@@ -36,6 +39,7 @@ class CrawlOrchestrator:
         jobs: JobRepository,
         urls: UrlRepository,
         discoveries: DiscoveryRepository,
+        attempts: AttemptRepository,
     ) -> None:
         self._fetch_client = fetch_client
         self._storage = storage
@@ -43,22 +47,44 @@ class CrawlOrchestrator:
         self._jobs = jobs
         self._urls = urls
         self._discoveries = discoveries
+        self._attempts = attempts
 
     async def process_url(self, *, url_id: UUID, worker_id: str) -> None:
-        url_row = await self._urls.mark_fetching(url_id=url_id, worker_id=worker_id)
-        job = await self._jobs.get(url_row.job_id)
+        claimed_url = await self._urls.get_claimed_url(url_id=url_id, worker_id=worker_id)
+        if claimed_url is None:
+            return
+
+        job = await self._jobs.get(claimed_url.job_id)
         if job is None:
             raise RuntimeError("crawl job does not exist")
+        if job.status is not JobStatus.RUNNING:
+            return
+
+        url_row = await self._urls.mark_fetching(url_id=url_id, worker_id=worker_id)
+        if url_row is None:
+            return
+        attempt = await self._attempts.start_attempt(
+            crawl_url_id=url_row.id,
+            attempt_number=url_row.fetch_attempts + 1,
+        )
 
         try:
             response = await self._fetch_client.fetch(url_row.normalized_url)
         except Exception as error:
-            await self._mark_transient_failure(
+            result_status = await self._mark_transient_failure(
                 url_row=url_row,
                 job=job,
                 worker_id=worker_id,
                 http_status_code=None,
                 error_code="fetch_error",
+                error_detail=str(error),
+            )
+            await self._finish_attempt(
+                attempt=attempt,
+                result_status=result_status,
+                http_status_code=None,
+                retry_after_seconds=None,
+                response_headers=None,
                 error_detail=str(error),
             )
             return
@@ -71,6 +97,14 @@ class CrawlOrchestrator:
                 error_code="not_found",
                 error_detail="404",
             )
+            await self._finish_attempt(
+                attempt=attempt,
+                result_status=UrlStatus.FAILED_PERMANENT.value,
+                http_status_code=404,
+                retry_after_seconds=None,
+                response_headers=response.headers,
+                error_detail="404",
+            )
             return
         if response.status_code == 403:
             await self._mark_permanent_failure(
@@ -80,20 +114,37 @@ class CrawlOrchestrator:
                 error_code="blocked",
                 error_detail="403",
             )
+            await self._finish_attempt(
+                attempt=attempt,
+                result_status=UrlStatus.FAILED_PERMANENT.value,
+                http_status_code=403,
+                retry_after_seconds=None,
+                response_headers=response.headers,
+                error_detail="403",
+            )
             return
         if response.status_code == 429:
-            await self._mark_transient_failure(
+            retry_after_seconds = _retry_after_seconds(response.headers, job.config)
+            result_status = await self._mark_transient_failure(
                 url_row=url_row,
                 job=job,
                 worker_id=worker_id,
                 http_status_code=429,
                 error_code="rate_limited",
                 error_detail="retry after",
-                retry_after_seconds=_retry_after_seconds(response.headers, job.config),
+                retry_after_seconds=retry_after_seconds,
+            )
+            await self._finish_attempt(
+                attempt=attempt,
+                result_status=result_status,
+                http_status_code=429,
+                retry_after_seconds=retry_after_seconds,
+                response_headers=response.headers,
+                error_detail="retry after",
             )
             return
         if response.status_code == 500:
-            await self._mark_transient_failure(
+            result_status = await self._mark_transient_failure(
                 url_row=url_row,
                 job=job,
                 worker_id=worker_id,
@@ -101,14 +152,30 @@ class CrawlOrchestrator:
                 error_code="server_error",
                 error_detail="500",
             )
+            await self._finish_attempt(
+                attempt=attempt,
+                result_status=result_status,
+                http_status_code=500,
+                retry_after_seconds=None,
+                response_headers=response.headers,
+                error_detail="500",
+            )
             return
         if response.status_code != 200:
-            await self._mark_transient_failure(
+            result_status = await self._mark_transient_failure(
                 url_row=url_row,
                 job=job,
                 worker_id=worker_id,
                 http_status_code=response.status_code,
                 error_code="unexpected_status",
+                error_detail=str(response.status_code),
+            )
+            await self._finish_attempt(
+                attempt=attempt,
+                result_status=result_status,
+                http_status_code=response.status_code,
+                retry_after_seconds=None,
+                response_headers=response.headers,
                 error_detail=str(response.status_code),
             )
             return
@@ -120,7 +187,7 @@ class CrawlOrchestrator:
                 worker_id=worker_id,
             )
         except Exception as error:
-            await self._mark_transient_failure(
+            result_status = await self._mark_transient_failure(
                 url_row=url_row,
                 job=job,
                 worker_id=worker_id,
@@ -128,6 +195,24 @@ class CrawlOrchestrator:
                 error_code="processing_error",
                 error_detail=str(error),
             )
+            await self._finish_attempt(
+                attempt=attempt,
+                result_status=result_status,
+                http_status_code=response.status_code,
+                retry_after_seconds=None,
+                response_headers=response.headers,
+                error_detail=str(error),
+            )
+            return
+
+        await self._finish_attempt(
+            attempt=attempt,
+            result_status="success",
+            http_status_code=response.status_code,
+            retry_after_seconds=None,
+            response_headers=response.headers,
+            error_detail=None,
+        )
 
     async def _process_success_response(
         self,
@@ -135,7 +220,7 @@ class CrawlOrchestrator:
         url_row: CrawlUrl,
         response: FetchResponse,
         worker_id: str,
-    ) -> None:
+    ) -> str:
         content_type = _content_type_from_headers(response.headers)
         processor = self._processors.processor_for(content_type)
         if not await self._urls.mark_processing(
@@ -282,7 +367,7 @@ class CrawlOrchestrator:
                 error_code="retry_exhausted",
                 error_detail=error_detail,
             )
-            return
+            return UrlStatus.FAILED_PERMANENT.value
 
         next_retry_at = compute_next_retry_at(
             now=datetime.now(UTC).replace(tzinfo=None),
@@ -300,6 +385,26 @@ class CrawlOrchestrator:
             http_status_code=http_status_code,
         ):
             raise RuntimeError("URL ownership was lost before retry scheduling")
+        return UrlStatus.RETRY_WAIT.value
+
+    async def _finish_attempt(
+        self,
+        *,
+        attempt: CrawlAttempt,
+        result_status: str,
+        http_status_code: int | None,
+        retry_after_seconds: int | None,
+        response_headers: dict[str, str] | None,
+        error_detail: str | None,
+    ) -> None:
+        await self._attempts.finish_attempt(
+            attempt=attempt,
+            result_status=result_status,
+            http_status_code=http_status_code,
+            retry_after_seconds=retry_after_seconds,
+            response_headers=response_headers,
+            error_detail=error_detail,
+        )
 
 
 def _content_type_from_headers(headers: dict[str, str]) -> str:

@@ -96,6 +96,9 @@ class JobRepository:
             config=deepcopy(inherited_config),
             parent_job_id=parent_job_id,
         )
+        child.status = JobStatus.RUNNING
+        child.started_at = _utcnow()
+        await self._session.flush()
         return child.id
 
     async def find_child_job(self, parent_job_id: UUID, seed_url: str) -> UUID | None:
