@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from sqlalchemy import delete, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -12,6 +13,7 @@ from crawler.config import Settings
 from crawler.db.models.enums import JobStatus, UrlStatus
 from crawler.db.models.jobs import CrawlJob
 from crawler.db.session import async_session_factory
+from crawler.main import create_app
 from crawler.repos.discoveries import DiscoveryRepository
 from crawler.repos.jobs import JobRepository
 from crawler.repos.urls import UrlRepository
@@ -20,6 +22,15 @@ from crawler.repos.urls import UrlRepository
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+async def async_client() -> AsyncIterator[httpx.AsyncClient]:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app()),
+        base_url="http://testserver",
+    ) as client:
+        yield client
 
 
 @pytest.fixture
@@ -83,6 +94,36 @@ async def test_request_pause_advances_a_drained_job_to_paused(async_session: Asy
     assert job.status is JobStatus.PAUSED
     assert job.pause_requested_at is not None
     assert result.paused_jobs == 1
+
+
+@pytest.mark.anyio
+async def test_pause_resume_cancel_endpoints_transition_job(
+    async_client: httpx.AsyncClient,
+) -> None:
+    create_response = await async_client.post(
+        "/crawls",
+        json={"seed_url": f"https://task-7-{uuid4().hex}.example.com", "child_rules": []},
+    )
+    assert create_response.status_code == 201
+    created_job_id = UUID(create_response.json()["id"])
+
+    session_factory = async_session_factory(Settings())
+    engine = session_factory.kw["bind"]
+    try:
+        pause_response = await async_client.post(f"/crawls/{created_job_id}/pause")
+        resume_response = await async_client.post(f"/crawls/{created_job_id}/resume")
+        cancel_response = await async_client.post(f"/crawls/{created_job_id}/cancel")
+
+        assert pause_response.status_code == 202
+        assert resume_response.status_code == 202
+        assert cancel_response.status_code == 202
+    finally:
+        async with session_factory() as session:
+            job = await session.get(CrawlJob, created_job_id)
+            if job is not None:
+                await session.delete(job)
+                await session.commit()
+        await engine.dispose()
 
 
 @pytest.mark.anyio
