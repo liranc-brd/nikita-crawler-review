@@ -234,7 +234,8 @@ class CrawlOrchestrator:
                 body=body,
                 headers=response.headers,
             )
-            processed, created_storage_path = await self._process_success_response(
+            created_storage_path = await self._storage.promote_staged_artifact(staged_artifact)
+            processed = await self._process_success_response(
                 url_row=url_row,
                 response=response,
                 content_type=content_type,
@@ -303,16 +304,15 @@ class CrawlOrchestrator:
         metadata: dict[str, object],
         staged_artifact,
         worker_id: str,
-    ) -> tuple[bool, bool]:
+    ) -> bool:
         if not await self._urls.mark_processing(
             url_id=url_row.id,
             worker_id=worker_id,
             content_type=content_type,
             http_status_code=response.status_code,
         ):
-            return False, False
+            return False
 
-        created_storage_path = await self._storage.promote_staged_artifact(staged_artifact)
         artifact = staged_artifact.artifact
         self._session.add(artifact)
         await self._session.flush()
@@ -332,8 +332,8 @@ class CrawlOrchestrator:
             worker_id=worker_id,
             content_artifact_id=artifact.id,  # type: ignore[attr-defined]
         ):
-            return False, created_storage_path
-        return True, created_storage_path
+            return False
+        return True
 
     async def discover_links(
         self,
