@@ -56,6 +56,11 @@ async def async_session(
             await session.commit()
 
 
+def _register_task_job(async_session: AsyncSession, job_id: UUID) -> None:
+    task_job_ids: set[UUID] = async_session.info["task4_job_ids"]
+    task_job_ids.add(job_id)
+
+
 async def _create_running_job_with_seed(async_session: AsyncSession) -> CrawlUrl:
     jobs = JobRepository(async_session)
     urls = UrlRepository(async_session)
@@ -64,8 +69,7 @@ async def _create_running_job_with_seed(async_session: AsyncSession) -> CrawlUrl
         seed_url=f"https://{hostname}",
         config={"max_attempts": 3, "child_rules": []},
     )
-    task_job_ids: set[UUID] = async_session.info["task4_job_ids"]
-    task_job_ids.add(job.id)
+    _register_task_job(async_session, job.id)
     job.status = JobStatus.RUNNING
     url = await urls.seed_url(job_id=job.id, seed_url=job.seed_url)
     await async_session.commit()
@@ -83,6 +87,7 @@ async def test_create_job_normalizes_seed_url_and_seed_url_is_idempotent(
         seed_url="HTTPS://Example.COM#ignored",
         config={"max_attempts": 3, "child_rules": []},
     )
+    _register_task_job(async_session, job.id)
     first = await urls.seed_url(job_id=job.id, seed_url=job.seed_url)
     second = await urls.seed_url(job_id=job.id, seed_url=job.seed_url)
 
@@ -98,6 +103,7 @@ async def test_create_job_uses_hostname_without_port(async_session: AsyncSession
         seed_url="https://example.com:8443/docs",
         config={"max_attempts": 3, "child_rules": []},
     )
+    _register_task_job(async_session, job.id)
 
     assert job.seed_hostname == "example.com"
 
@@ -277,6 +283,7 @@ async def test_seed_url_persists_normalized_url_hash(async_session: AsyncSession
         seed_url="https://example.com",
         config={"max_attempts": 3, "child_rules": []},
     )
+    _register_task_job(async_session, job.id)
 
     seed = await urls.seed_url(job_id=job.id, seed_url="https://EXAMPLE.com/docs#section")
     saved = await async_session.scalar(select(CrawlUrl).where(CrawlUrl.id == seed.id))

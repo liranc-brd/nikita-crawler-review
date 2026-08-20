@@ -208,3 +208,49 @@ GREEN verification:
 ### Concerns
 
 None.
+
+## Fix Round 4
+
+### Root Cause
+
+Three direct Task 4 `create_job` test paths bypassed the helper that records
+job IDs for per-test teardown. Their job IDs were therefore absent from the
+`task4_job_ids` cleanup registry.
+
+### Implemented
+
+- Added the test-only `_register_task_job` helper in
+  `test_claiming_and_leases.py`.
+- Registered jobs in the three direct creation tests and routed the existing
+  running-job helper through the same registration path.
+- No application or repository behavior changed.
+
+### TDD Evidence
+
+RED audit before the change:
+
+- `rg -n -C 2 "create_job\(|_register_task_job" tests/integration/test_claiming_and_leases.py`
+  showed the three specified direct `create_job` calls without cleanup
+  registration.
+
+GREEN verification:
+
+- Focused cleanup paths:
+  `DATABASE_URL=postgresql+asyncpg://crawler:crawler@localhost:5432/crawler RABBITMQ_URL=amqp://guest:guest@localhost:5672/ venv/bin/pytest tests/integration/test_claiming_and_leases.py::test_create_job_normalizes_seed_url_and_seed_url_is_idempotent tests/integration/test_claiming_and_leases.py::test_create_job_uses_hostname_without_port tests/integration/test_claiming_and_leases.py::test_seed_url_persists_normalized_url_hash -v`
+  Result: `3 passed in 0.28s`.
+- Task 4 integration suite:
+  `DATABASE_URL=postgresql+asyncpg://crawler:crawler@localhost:5432/crawler RABBITMQ_URL=amqp://guest:guest@localhost:5672/ venv/bin/pytest tests/integration/test_claiming_and_leases.py tests/integration/test_pause_resume_cancel.py -v`
+  Result: `17 passed in 0.97s`.
+- Full project suite:
+  `DATABASE_URL=postgresql+asyncpg://crawler:crawler@localhost:5432/crawler RABBITMQ_URL=amqp://guest:guest@localhost:5672/ venv/bin/pytest -v`
+  Result: `31 passed in 1.15s`.
+
+### Self-Review
+
+- Confirmed every `create_job` call in both Task 4 integration modules records
+  its job ID directly or through the corresponding running-job helper.
+- `git diff --check` passed.
+
+### Concerns
+
+None.
