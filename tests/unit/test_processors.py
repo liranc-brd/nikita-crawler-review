@@ -127,6 +127,23 @@ async def test_artifact_storage_persists_body_and_metadata(tmp_path: Path) -> No
 
 
 @pytest.mark.anyio
+async def test_artifact_storage_preserves_lowercase_validator_headers(tmp_path: Path) -> None:
+    from crawler.services.storage import ArtifactStorage
+
+    artifact = await ArtifactStorage(root=tmp_path / "output").persist_artifact(
+        job_id=uuid4(),
+        crawl_url_id=uuid4(),
+        content_type="text/html",
+        url="https://example.com/page",
+        body=b"<html></html>",
+        headers={"etag": "lowercase-etag", "last-modified": "yesterday"},
+    )
+
+    assert artifact.etag == "lowercase-etag"
+    assert artifact.last_modified == "yesterday"
+
+
+@pytest.mark.anyio
 async def test_fetch_client_returns_validated_fetch_response() -> None:
     from crawler.services.fetch_client import FetchClient
 

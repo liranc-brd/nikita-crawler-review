@@ -37,6 +37,7 @@ class ArtifactStorage:
     ) -> ContentArtifact:
         normalized_url = normalize_url(url)
         content_hash = hashlib.sha256(body).hexdigest()
+        headers_by_name = {name.lower(): value for name, value in headers.items()}
         storage_path = self.build_storage_path(
             content_type=content_type,
             normalized_url=normalized_url,
@@ -51,8 +52,8 @@ class ArtifactStorage:
             filename=storage_path.name,
             content_length=len(body),
             content_hash=content_hash,
-            etag=headers.get("ETag"),
-            last_modified=headers.get("Last-Modified"),
+            etag=headers_by_name.get("etag"),
+            last_modified=headers_by_name.get("last-modified"),
         )
         if self._session is not None:
             self._session.add(artifact)
