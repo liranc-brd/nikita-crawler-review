@@ -130,6 +130,10 @@ None.
 
 ### Commit
 
+Fix Round 2 implementation committed as `820b813 fix: require terminal frontier before cancellation`.
+
+### Commit
+
 Fix Round 1 implementation committed as `4047b32 fix: harden crawl state transitions`.
 
 ## Fix Round 2
