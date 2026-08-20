@@ -11,7 +11,7 @@ dependencies = [
   "uvicorn[standard]",
   "pydantic>=2.8",
   "pydantic-settings",
-  "sqlalchemy>=2.0",
+  "sqlalchemy[asyncio]>=2.0",
   "asyncpg",
   "alembic",
   "aio-pika",
