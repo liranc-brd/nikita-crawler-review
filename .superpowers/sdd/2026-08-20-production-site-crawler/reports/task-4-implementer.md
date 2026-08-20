@@ -132,6 +132,44 @@ None.
 
 Fix Round 2 implementation committed as `820b813 fix: require terminal frontier before cancellation`.
 
+## Fix Round 3
+
+### Root Cause
+
+Both Task 4 integration modules deleted every database row whose hostname
+matched `task4-%.example.com` during fixture teardown. Concurrent test runs
+could therefore delete one another's jobs and URLs, which caused the reported
+foreign-key, stale-instance, zero-release, and unrelated-claim failures.
+
+### Implemented
+
+- Added a session-level PostgreSQL advisory lock around each Task 4 integration
+  test, while retaining independent worker and recovery sessions inside a test.
+- Replaced broad hostname cleanup with per-test cleanup of explicitly recorded
+  job IDs. Parent and manually-created child jobs are both recorded.
+- No repository state-transition or claim-locking behavior changed.
+
+### TDD Evidence
+
+RED evidence came from the authoritative local verification failures:
+
+- The cancellation recovery session released `0` leases instead of `1`.
+- Lease recovery refresh raised `InvalidRequestError`; completion raised
+  `StaleDataError`.
+- A second worker claimed unrelated work, and the race test intermittently
+  failed with a foreign-key violation.
+
+GREEN verification:
+
+- Focused cancellation race regression: `1 passed`.
+- Remaining reported focused regressions: `4 passed`.
+- Covering Task 4 integration suite: `17 passed`.
+- Full project suite: `31 passed`.
+
+### Concerns
+
+None.
+
 ### Commit
 
 Fix Round 1 implementation committed as `4047b32 fix: harden crawl state transitions`.

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from crawler.config import Settings
@@ -31,16 +31,29 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 
 
 @pytest.fixture
+async def test_database_lock(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[None]:
+    engine = session_factory.kw["bind"]
+    async with engine.connect() as connection:
+        await connection.execute(text("SELECT pg_advisory_lock(2026082004)"))
+        yield
+        await connection.execute(text("SELECT pg_advisory_unlock(2026082004)"))
+
+
+@pytest.fixture
 async def async_session(
     session_factory: async_sessionmaker[AsyncSession],
+    test_database_lock: None,
 ) -> AsyncIterator[AsyncSession]:
     async with session_factory() as session:
+        session.info["task4_job_ids"] = set()
         yield session
         await session.rollback()
-        await session.execute(
-            delete(CrawlJob).where(CrawlJob.seed_hostname.like("task4-%.example.com"))
-        )
-        await session.commit()
+        job_ids: set[UUID] = session.info["task4_job_ids"]
+        if job_ids:
+            await session.execute(delete(CrawlJob).where(CrawlJob.id.in_(job_ids)))
+            await session.commit()
 
 
 async def _create_running_job_with_seed(async_session: AsyncSession) -> CrawlUrl:
@@ -51,6 +64,8 @@ async def _create_running_job_with_seed(async_session: AsyncSession) -> CrawlUrl
         seed_url=f"https://{hostname}",
         config={"max_attempts": 3, "child_rules": []},
     )
+    task_job_ids: set[UUID] = async_session.info["task4_job_ids"]
+    task_job_ids.add(job.id)
     job.status = JobStatus.RUNNING
     url = await urls.seed_url(job_id=job.id, seed_url=job.seed_url)
     await async_session.commit()
