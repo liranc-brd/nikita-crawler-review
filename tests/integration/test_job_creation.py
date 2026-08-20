@@ -19,11 +19,7 @@ def anyio_backend() -> str:
 
 
 @pytest.fixture
-async def async_session(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[AsyncSession]:
-    monkeypatch.setenv(
-        "DATABASE_URL", "postgresql+asyncpg://crawler:crawler@localhost:5432/crawler"
-    )
-    monkeypatch.setenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+async def async_session() -> AsyncIterator[AsyncSession]:
     session_factory = async_session_factory(Settings())
     engine = session_factory.kw["bind"]
 
