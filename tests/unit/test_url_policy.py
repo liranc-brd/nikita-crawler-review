@@ -22,3 +22,9 @@ def test_should_spawn_child_matches_prefix_rule() -> None:
     rules = [{"kind": "path_prefix", "value": "/products"}]
     assert should_spawn_child("https://example.com/products/42", rules) is True
     assert should_spawn_child("https://example.com/blog/42", rules) is False
+
+
+def test_should_spawn_child_matches_regex_rule() -> None:
+    rules = [{"kind": "regex", "value": r"^/products/\d+$"}]
+    assert should_spawn_child("https://example.com/products/42", rules) is True
+    assert should_spawn_child("https://example.com/products/featured", rules) is False

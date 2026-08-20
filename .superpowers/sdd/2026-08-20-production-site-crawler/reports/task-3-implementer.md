@@ -55,3 +55,45 @@ No Task 3 correctness or scope findings. The implementation preserves strict hos
 ## Issues or concerns
 
 The required integration and full-suite commands remain environment-blocked by missing `DATABASE_URL` and `RABBITMQ_URL`. No changes were made to unrelated generated caches or existing untracked directories.
+
+## Fix Round 1
+
+### Reviewer finding addressed
+
+Added support for `{"kind": "regex", "value": "..."}` child rules. The configured regular expression is evaluated against the normalized URL path with `re.search`; existing `path_prefix` matching, strict hostname comparison, and retry behavior are unchanged.
+
+### TDD evidence
+
+RED command:
+
+```text
+venv/bin/pytest tests/unit/test_url_policy.py::test_should_spawn_child_matches_regex_rule -v
+```
+
+Result: 1 failed because the existing matcher returned `False` for the new `kind="regex"` rule.
+
+GREEN command:
+
+```text
+venv/bin/pytest tests/unit/test_url_policy.py::test_should_spawn_child_matches_regex_rule tests/unit/test_url_policy.py -v
+```
+
+Result: 5 passed.
+
+Final covering command:
+
+```text
+venv/bin/pytest tests/unit/test_url_policy.py tests/unit/test_retry_policy.py -v
+```
+
+Result: 8 passed.
+
+### Fix-round files
+
+- `src/crawler/domain/url_policy.py`
+- `tests/unit/test_url_policy.py`
+- This report file.
+
+### Fix-round self-review
+
+No additional findings. The change is limited to the requested regex child-rule kind and focused regression coverage.

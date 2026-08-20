@@ -1,3 +1,4 @@
+import re
 import urllib.parse
 
 
@@ -16,6 +17,13 @@ def is_same_hostname(seed_hostname: str, candidate_url: str) -> bool:
 def should_spawn_child(url: str, child_rules: list[dict[str, str]]) -> bool:
     path = urllib.parse.urlsplit(url).path or "/"
     return any(
-        rule.get("kind") == "path_prefix" and path.startswith(rule.get("value", ""))
+        (
+            rule.get("kind") == "path_prefix"
+            and path.startswith(rule.get("value", ""))
+        )
+        or (
+            rule.get("kind") == "regex"
+            and re.search(rule.get("value", ""), path) is not None
+        )
         for rule in child_rules
     )
