@@ -7,7 +7,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from sqlalchemy import exists, select, text, update
+from sqlalchemy import exists, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -226,6 +226,26 @@ class JobRepository:
             canceled_jobs=len(canceled.scalars().all()),
             completed_jobs=len(completed.scalars().all()),
         )
+
+    async def list_jobs_with_runnable_work(self, *, now: datetime) -> list[UUID]:
+        statement = (
+            select(CrawlUrl.job_id)
+            .join(CrawlJob)
+            .where(CrawlJob.status == JobStatus.RUNNING)
+            .where(CrawlUrl.status.in_((UrlStatus.QUEUED, UrlStatus.RETRY_WAIT)))
+            .where(
+                or_(
+                    CrawlUrl.next_eligible_at.is_(None),
+                    CrawlUrl.next_eligible_at <= now,
+                )
+            )
+            .distinct()
+            .order_by(CrawlUrl.job_id)
+        )
+        return list((await self._session.scalars(statement)).all())
+
+    async def list_resumable_jobs(self, *, now: datetime) -> list[UUID]:
+        return await self.list_jobs_with_runnable_work(now=now)
 
     def _job_ids_to_cancel(self, job_id: UUID, cascade_children: bool):
         if not cascade_children:
