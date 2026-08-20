@@ -80,7 +80,7 @@ class UrlRepository:
                 )
             )
             .order_by(CrawlUrl.next_eligible_at, CrawlUrl.id)
-            .with_for_update(skip_locked=True)
+            .with_for_update(of=CrawlUrl, skip_locked=True)
             .limit(limit)
         )
         rows = list((await self._session.execute(stmt)).scalars().all())
@@ -142,13 +142,18 @@ class UrlRepository:
         self,
         *,
         url_id: UUID,
+        worker_id: str,
         next_eligible_at: datetime,
         error_code: str,
         error_detail: str,
-    ) -> None:
-        await self._session.execute(
+    ) -> bool:
+        result = await self._session.execute(
             update(CrawlUrl)
-            .where(CrawlUrl.id == url_id)
+            .where(
+                CrawlUrl.id == url_id,
+                CrawlUrl.claimed_by == worker_id,
+                CrawlUrl.status.in_(ACTIVE_URL_STATUSES),
+            )
             .values(
                 status=UrlStatus.RETRY_WAIT,
                 fetch_attempts=CrawlUrl.fetch_attempts + 1,
@@ -160,5 +165,7 @@ class UrlRepository:
                 error_code=error_code,
                 error_detail=error_detail,
             )
+            .returning(CrawlUrl.id)
         )
         await self._session.flush()
+        return result.scalar_one_or_none() is not None

@@ -83,3 +83,47 @@ policy; the same commands were rerun with approved local-database access.
 ## Issues Or Concerns
 
 None.
+
+## Fix Round 1
+
+### Implemented
+
+- Narrowed the claim lock to `CrawlUrl` with PostgreSQL-equivalent
+  `FOR UPDATE OF crawl_urls SKIP LOCKED`, allowing independent URL rows from
+  the same job to be claimed concurrently.
+- Guarded `mark_retry_wait` by `url_id`, `worker_id`, and active URL state.
+  It now returns `True` only when the guarded transition succeeds, preventing
+  stale workers from overwriting reclaimed work.
+- Updated lifecycle advancement to move every non-active, non-terminal URL
+  for `canceling` jobs to `canceled` before finalizing a drained job as
+  `canceled`. This includes URLs released after their lease expires.
+
+### Regression Coverage
+
+- Two separate sessions claim distinct URLs in the same job concurrently.
+- A stale worker cannot put a URL back into retry wait after the lease is
+  released and another worker has claimed it.
+- A canceling job with an expired claim finalizes both the recovered URL and
+  the job as `canceled`.
+
+### TDD Evidence
+
+RED command:
+
+`DATABASE_URL=postgresql+asyncpg://crawler:crawler@localhost:5432/crawler RABBITMQ_URL=amqp://guest:guest@localhost:5672/ venv/bin/pytest tests/integration/test_claiming_and_leases.py::test_claim_runnable_urls_allows_workers_to_claim_distinct_urls_in_one_job tests/integration/test_claiming_and_leases.py::test_mark_retry_wait_rejects_a_stale_worker_after_reclaim tests/integration/test_pause_resume_cancel.py::test_cancel_finalizes_a_url_recovered_after_cancel_request -v`
+
+Result: all three tests failed as expected. The second worker could not claim
+the second URL, `mark_retry_wait` did not accept a worker ID, and the recovered
+URL remained `queued` after its job became `canceled`.
+
+GREEN verification:
+
+- Focused two-worker/two-URL claim regression: `1 passed`.
+- Focused retry ownership regressions: `2 passed`.
+- Focused cancellation and lease-recovery regressions: `2 passed`.
+- Covering Task 4 integration suite: `16 passed`.
+- Full project suite: `30 passed`.
+
+### Concerns
+
+None.

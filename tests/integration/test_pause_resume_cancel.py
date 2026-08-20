@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -110,6 +110,30 @@ async def test_request_cancel_cascades_to_children_and_cancels_runnable_urls(
     assert child.status is JobStatus.CANCELED
     assert queued.status is UrlStatus.CANCELED
     assert result.canceled_jobs == 2
+
+
+@pytest.mark.anyio
+async def test_cancel_finalizes_a_url_recovered_after_cancel_request(
+    async_session: AsyncSession,
+) -> None:
+    job = await _create_running_job(async_session)
+    url = await UrlRepository(async_session).seed_url(job_id=job.id, seed_url=job.seed_url)
+    frozen_now = datetime(2026, 8, 20, 12, 0, 0)
+    url.status = UrlStatus.CLAIMED
+    url.claimed_by = "dead-worker"
+    url.lease_expires_at = frozen_now - timedelta(seconds=1)
+    await async_session.commit()
+
+    jobs = JobRepository(async_session)
+    await jobs.request_cancel(job.id)
+    assert await UrlRepository(async_session).release_expired_leases(now=frozen_now) == 1
+    result = await jobs.advance_lifecycle_states(now=frozen_now)
+    await async_session.refresh(job)
+    await async_session.refresh(url)
+
+    assert result.canceled_jobs == 1
+    assert job.status is JobStatus.CANCELED
+    assert url.status is UrlStatus.CANCELED
 
 
 @pytest.mark.anyio

@@ -117,6 +117,21 @@ class JobRepository:
         return result.scalar_one_or_none() is not None
 
     async def advance_lifecycle_states(self, *, now: datetime) -> LifecycleAdvanceResult:
+        canceling_job_ids = select(CrawlJob.id).where(CrawlJob.status == JobStatus.CANCELING)
+        await self._session.execute(
+            update(CrawlUrl)
+            .where(
+                CrawlUrl.job_id.in_(canceling_job_ids),
+                CrawlUrl.status.not_in(ACTIVE_URL_STATUSES + TERMINAL_URL_STATUSES),
+            )
+            .values(
+                status=UrlStatus.CANCELED,
+                claimed_by=None,
+                claimed_at=None,
+                lease_expires_at=None,
+                last_heartbeat_at=None,
+            )
+        )
         active_urls_exist = self._active_urls_exist()
         paused = await self._session.execute(
             update(CrawlJob)

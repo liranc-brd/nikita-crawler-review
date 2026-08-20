@@ -107,6 +107,34 @@ async def test_claim_runnable_urls_allows_only_one_active_worker(
 
 
 @pytest.mark.anyio
+async def test_claim_runnable_urls_allows_workers_to_claim_distinct_urls_in_one_job(
+    async_session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    first_url = await _create_running_job_with_seed(async_session)
+    second_url = await UrlRepository(async_session).seed_url(
+        job_id=first_url.job_id,
+        seed_url=f"{first_url.normalized_url}second",
+    )
+    await async_session.commit()
+
+    async with session_factory() as worker_a_session:
+        async with session_factory() as worker_b_session:
+            first = await UrlRepository(worker_a_session).claim_runnable_urls(
+                worker_id="worker-a",
+                limit=1,
+            )
+            second = await UrlRepository(worker_b_session).claim_runnable_urls(
+                worker_id="worker-b",
+                limit=1,
+            )
+
+    assert len(first) == 1
+    assert len(second) == 1
+    assert {first[0].id, second[0].id} == {first_url.id, second_url.id}
+
+
+@pytest.mark.anyio
 async def test_claim_runnable_urls_skips_not_yet_eligible_retry_work(
     async_session: AsyncSession,
 ) -> None:
@@ -178,20 +206,52 @@ async def test_mark_retry_wait_releases_the_claim_and_records_error(async_sessio
     next_eligible_at = datetime(2026, 8, 20, 12, 1, 0)
     await async_session.commit()
 
-    await UrlRepository(async_session).mark_retry_wait(
+    updated = await UrlRepository(async_session).mark_retry_wait(
         url_id=url.id,
+        worker_id="worker-a",
         next_eligible_at=next_eligible_at,
         error_code="rate_limited",
         error_detail="retry after",
     )
     await async_session.refresh(url)
 
+    assert updated is True
     assert url.status is UrlStatus.RETRY_WAIT
     assert url.fetch_attempts == 1
     assert url.next_eligible_at == next_eligible_at
     assert url.claimed_by is None
     assert url.error_code == "rate_limited"
     assert url.error_detail == "retry after"
+
+
+@pytest.mark.anyio
+async def test_mark_retry_wait_rejects_a_stale_worker_after_reclaim(
+    async_session: AsyncSession,
+) -> None:
+    url = await _create_running_job_with_seed(async_session)
+    frozen_now = datetime(2026, 8, 20, 12, 0, 0)
+    url.status = UrlStatus.CLAIMED
+    url.claimed_by = "worker-a"
+    url.lease_expires_at = frozen_now - timedelta(seconds=1)
+    await async_session.commit()
+
+    repo = UrlRepository(async_session)
+    assert await repo.release_expired_leases(now=frozen_now) == 1
+    reclaimed = await repo.claim_runnable_urls(worker_id="worker-b", limit=1)
+    updated = await repo.mark_retry_wait(
+        url_id=url.id,
+        worker_id="worker-a",
+        next_eligible_at=frozen_now + timedelta(minutes=1),
+        error_code="stale_failure",
+        error_detail="worker-a finished after its lease expired",
+    )
+    await async_session.refresh(url)
+
+    assert len(reclaimed) == 1
+    assert updated is False
+    assert url.status is UrlStatus.CLAIMED
+    assert url.claimed_by == "worker-b"
+    assert url.fetch_attempts == 0
 
 
 @pytest.mark.anyio
