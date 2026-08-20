@@ -253,6 +253,9 @@ class UrlRepository:
                 CrawlUrl.id == url_id,
                 CrawlUrl.claimed_by == worker_id,
                 CrawlUrl.status.in_(ACTIVE_URL_STATUSES),
+                CrawlUrl.job_id.in_(
+                    select(CrawlJob.id).where(CrawlJob.status == JobStatus.RUNNING)
+                ),
             )
             .values(
                 status=UrlStatus.RETRY_WAIT,
@@ -286,6 +289,9 @@ class UrlRepository:
                 CrawlUrl.id == url_id,
                 CrawlUrl.claimed_by == worker_id,
                 CrawlUrl.status.in_(ACTIVE_URL_STATUSES),
+                CrawlUrl.job_id.in_(
+                    select(CrawlJob.id).where(CrawlJob.status == JobStatus.RUNNING)
+                ),
             )
             .values(
                 status=UrlStatus.FAILED_PERMANENT,

@@ -54,6 +54,17 @@ class JobRepository:
             )
         ) is not None
 
+    async def lock_running_job(self, job_id: UUID) -> CrawlJob | None:
+        return await self._session.scalar(
+            select(CrawlJob)
+            .where(
+                CrawlJob.id == job_id,
+                CrawlJob.status == JobStatus.RUNNING,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+
     async def create_job(
         self,
         *,

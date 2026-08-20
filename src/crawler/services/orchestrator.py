@@ -79,6 +79,8 @@ class CrawlOrchestrator:
                 error_code="fetch_error",
                 error_detail=str(error),
             )
+            if result_status is None:
+                return
             await self._finish_attempt(
                 attempt=attempt,
                 result_status=result_status,
@@ -89,17 +91,16 @@ class CrawlOrchestrator:
             )
             return
 
-        if not await self._jobs.is_running(url_row.job_id):
-            return
-
         if response.status_code == 404:
-            await self._mark_permanent_failure(
+            transitioned = await self._mark_permanent_failure(
                 url_id=url_id,
                 worker_id=worker_id,
                 http_status_code=404,
                 error_code="not_found",
                 error_detail="404",
             )
+            if not transitioned:
+                return
             await self._finish_attempt(
                 attempt=attempt,
                 result_status=UrlStatus.FAILED_PERMANENT.value,
@@ -110,13 +111,15 @@ class CrawlOrchestrator:
             )
             return
         if response.status_code == 403:
-            await self._mark_permanent_failure(
+            transitioned = await self._mark_permanent_failure(
                 url_id=url_id,
                 worker_id=worker_id,
                 http_status_code=403,
                 error_code="blocked",
                 error_detail="403",
             )
+            if not transitioned:
+                return
             await self._finish_attempt(
                 attempt=attempt,
                 result_status=UrlStatus.FAILED_PERMANENT.value,
@@ -137,6 +140,8 @@ class CrawlOrchestrator:
                 error_detail="retry after",
                 retry_after_seconds=retry_after_seconds,
             )
+            if result_status is None:
+                return
             await self._finish_attempt(
                 attempt=attempt,
                 result_status=result_status,
@@ -155,6 +160,8 @@ class CrawlOrchestrator:
                 error_code="server_error",
                 error_detail="500",
             )
+            if result_status is None:
+                return
             await self._finish_attempt(
                 attempt=attempt,
                 result_status=result_status,
@@ -173,6 +180,8 @@ class CrawlOrchestrator:
                 error_code="unexpected_status",
                 error_detail=str(response.status_code),
             )
+            if result_status is None:
+                return
             await self._finish_attempt(
                 attempt=attempt,
                 result_status=result_status,
@@ -198,6 +207,8 @@ class CrawlOrchestrator:
                 error_code="processing_error",
                 error_detail=str(error),
             )
+            if result_status is None:
+                return
             await self._finish_attempt(
                 attempt=attempt,
                 result_status=result_status,
@@ -227,7 +238,8 @@ class CrawlOrchestrator:
         response: FetchResponse,
         worker_id: str,
     ) -> bool:
-        if not await self._jobs.is_running(url_row.job_id):
+        job = await self._jobs.lock_running_job(url_row.job_id)
+        if job is None:
             return False
 
         content_type = _content_type_from_headers(response.headers)
@@ -242,9 +254,6 @@ class CrawlOrchestrator:
 
         body = response.body or b""
         metadata = processor.extract_metadata(body, response.headers)
-        if not await self._jobs.is_running(url_row.job_id):
-            return False
-
         artifact = await self._storage.persist_artifact(
             job_id=url_row.job_id,
             crawl_url_id=url_row.id,
@@ -253,17 +262,11 @@ class CrawlOrchestrator:
             body=body,
             headers=response.headers,
         )
-        if not await self._jobs.is_running(url_row.job_id):
-            return False
-
         await self._storage.persist_metadata(
             artifact_id=artifact.id,
             metadata_type=processor.metadata_type,
             metadata=metadata,
         )
-        if not await self._jobs.is_running(url_row.job_id):
-            return False
-
         await self.discover_links(
             job_id=url_row.job_id,
             source_url_id=url_row.id,
@@ -286,26 +289,18 @@ class CrawlOrchestrator:
         source_url: str,
         links: Iterable[str],
     ) -> DiscoveryOutcome:
-        job = await self._jobs.get(job_id)
+        job = await self._jobs.lock_running_job(job_id)
         if job is None:
             raise RuntimeError("crawl job does not exist")
-        if not await self._jobs.is_running(job.id):
-            return DiscoveryOutcome(
-                enqueued_urls=0,
-                recorded_links=0,
-                spawned_child_jobs=0,
-            )
 
         resolved_links = list(links)
         enqueued_urls = 0
         recorded_links = 0
         spawned_child_jobs = 0
         for link in resolved_links:
-            if not await self._jobs.is_running(job.id):
-                break
             normalized_link = normalize_url(link, base_url=source_url)
             same_hostname = is_same_hostname(job.seed_hostname, normalized_link)
-            child_job_id = await self.create_child_job_if_needed(
+            child_job_id = await self._create_child_job_if_needed_locked(
                 parent_job=job,
                 seed_url=normalized_link,
             )
@@ -341,8 +336,20 @@ class CrawlOrchestrator:
         parent_job: CrawlJob,
         seed_url: str,
     ) -> UUID | None:
-        if not await self._jobs.is_running(parent_job.id):
+        locked_parent_job = await self._jobs.lock_running_job(parent_job.id)
+        if locked_parent_job is None:
             return None
+        return await self._create_child_job_if_needed_locked(
+            parent_job=locked_parent_job,
+            seed_url=seed_url,
+        )
+
+    async def _create_child_job_if_needed_locked(
+        self,
+        *,
+        parent_job: CrawlJob,
+        seed_url: str,
+    ) -> UUID | None:
         if not is_same_hostname(parent_job.seed_hostname, seed_url):
             return None
         if not should_spawn_child(seed_url, parent_job.config.get("child_rules", [])):
@@ -365,15 +372,14 @@ class CrawlOrchestrator:
         http_status_code: int | None,
         error_code: str,
         error_detail: str,
-    ) -> None:
-        if not await self._urls.mark_failed_permanent(
+    ) -> bool:
+        return await self._urls.mark_failed_permanent(
             url_id=url_id,
             worker_id=worker_id,
             http_status_code=http_status_code,
             error_code=error_code,
             error_detail=error_detail,
-        ):
-            raise RuntimeError("URL ownership was lost before terminal failure")
+        )
 
     async def _mark_transient_failure(
         self,
@@ -385,17 +391,18 @@ class CrawlOrchestrator:
         error_code: str,
         error_detail: str,
         retry_after_seconds: int | None = None,
-    ) -> str:
+    ) -> str | None:
         attempt_number = url_row.fetch_attempts + 1
         max_attempts = int(job.config.get("max_attempts", 3))
         if attempt_number >= max_attempts:
-            await self._mark_permanent_failure(
+            if not await self._mark_permanent_failure(
                 url_id=url_row.id,
                 worker_id=worker_id,
                 http_status_code=http_status_code,
                 error_code="retry_exhausted",
                 error_detail=error_detail,
-            )
+            ):
+                return None
             return UrlStatus.FAILED_PERMANENT.value
 
         next_retry_at = compute_next_retry_at(
@@ -413,7 +420,7 @@ class CrawlOrchestrator:
             error_detail=error_detail,
             http_status_code=http_status_code,
         ):
-            raise RuntimeError("URL ownership was lost before retry scheduling")
+            return None
         return UrlStatus.RETRY_WAIT.value
 
     async def _finish_attempt(

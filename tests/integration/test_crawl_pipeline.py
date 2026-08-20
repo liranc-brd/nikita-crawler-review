@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -460,3 +461,106 @@ async def test_stopped_job_after_fetch_does_not_persist_or_discover(
     assert attempt.finished_at is None
     assert metadata is None
     assert discoveries == []
+
+
+@pytest.mark.anyio
+async def test_stopped_job_before_post_fetch_failure_transition_preserves_fetching_state(
+    app_container: CrawlTestContainer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_container.fetch_response.update(
+        {"status_code": 404, "headers": {"Content-Type": "text/html"}, "body": ""}
+    )
+    original_mark_failed_permanent = app_container.url_repo.mark_failed_permanent
+
+    async def stop_job_before_failure_transition(**kwargs: object) -> bool:
+        parent_job = await app_container.async_session.get(
+            CrawlJob, app_container.parent_job_id
+        )
+        assert parent_job is not None
+        parent_job.status = JobStatus.PAUSED
+        await app_container.async_session.flush()
+        return await original_mark_failed_permanent(**kwargs)
+
+    monkeypatch.setattr(
+        app_container.url_repo,
+        "mark_failed_permanent",
+        stop_job_before_failure_transition,
+    )
+
+    await app_container.orchestrator.process_url(
+        url_id=app_container.seed_url_id,
+        worker_id="worker-a",
+    )
+
+    crawl_url = await app_container.async_session.get(CrawlUrl, app_container.seed_url_id)
+    attempt = await app_container.async_session.scalar(
+        select(CrawlAttempt).where(CrawlAttempt.crawl_url_id == app_container.seed_url_id)
+    )
+
+    assert crawl_url is not None
+    assert crawl_url.status is UrlStatus.FETCHING
+    assert attempt is not None
+    assert attempt.result_status == "in_progress"
+    assert attempt.finished_at is None
+
+
+@pytest.mark.anyio
+async def test_pause_request_at_artifact_boundary_waits_for_successful_writes(
+    app_container: CrawlTestContainer,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_boundary_reached = asyncio.Event()
+    allow_artifact_persistence = asyncio.Event()
+    original_persist_artifact = app_container.orchestrator._storage.persist_artifact
+
+    async def persist_artifact_after_pause_request(**kwargs: object) -> ContentArtifact:
+        artifact_boundary_reached.set()
+        await allow_artifact_persistence.wait()
+        return await original_persist_artifact(**kwargs)
+
+    monkeypatch.setattr(
+        app_container.orchestrator._storage,
+        "persist_artifact",
+        persist_artifact_after_pause_request,
+    )
+
+    async def request_pause() -> None:
+        async with session_factory() as session:
+            await JobRepository(session).request_pause(app_container.parent_job_id)
+            await session.commit()
+
+    process_task = asyncio.create_task(
+        app_container.orchestrator.process_url(
+            url_id=app_container.seed_url_id,
+            worker_id="worker-a",
+        )
+    )
+    await asyncio.wait_for(artifact_boundary_reached.wait(), timeout=1)
+    pause_task = asyncio.create_task(request_pause())
+
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(pause_task), timeout=0.1)
+    finally:
+        allow_artifact_persistence.set()
+        await process_task
+        await app_container.async_session.commit()
+        await pause_task
+
+    parent_job = await app_container.async_session.get(CrawlJob, app_container.parent_job_id)
+    assert parent_job is not None
+    await app_container.async_session.refresh(parent_job)
+    artifact = await app_container.async_session.scalar(
+        select(ContentArtifact).where(ContentArtifact.crawl_url_id == app_container.seed_url_id)
+    )
+    metadata = await app_container.async_session.scalar(
+        select(ContentMetadata).where(ContentMetadata.artifact_id == artifact.id)
+    )
+    discoveries = list((await app_container.async_session.scalars(select(DiscoveredLink))).all())
+
+    assert parent_job.status is JobStatus.PAUSING
+    assert artifact is not None
+    assert metadata is not None
+    assert discoveries
