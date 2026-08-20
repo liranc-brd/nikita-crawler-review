@@ -136,6 +136,7 @@ async def app_container(
             async_session=async_session,
             http_client=http_client,
             orchestrator=CrawlOrchestrator(
+                session=async_session,
                 fetch_client=FetchClient(http_client),
                 storage=ArtifactStorage(session=async_session),
                 processors=ProcessorRegistry(),
@@ -370,6 +371,67 @@ async def test_processing_error_enters_retry_wait(
 
 
 @pytest.mark.anyio
+async def test_post_stage_processing_error_retries_without_leaving_expired_state(
+    app_container: CrawlTestContainer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def explode_metadata(**kwargs: object) -> ContentMetadata:
+        raise RuntimeError("metadata explosion")
+
+    monkeypatch.setattr(
+        app_container.orchestrator._storage,
+        "persist_metadata",
+        explode_metadata,
+    )
+
+    await app_container.orchestrator.process_url(
+        url_id=app_container.seed_url_id,
+        worker_id="worker-a",
+    )
+
+    crawl_url = await app_container.async_session.get(CrawlUrl, app_container.seed_url_id)
+    attempt = await app_container.async_session.scalar(
+        select(CrawlAttempt).where(CrawlAttempt.crawl_url_id == app_container.seed_url_id)
+    )
+
+    assert crawl_url is not None
+    await app_container.async_session.refresh(crawl_url)
+    assert crawl_url.status is UrlStatus.RETRY_WAIT
+    assert crawl_url.error_code == "processing_error"
+    assert attempt is not None
+    assert attempt.result_status == UrlStatus.RETRY_WAIT.value
+    assert attempt.error_detail == "metadata explosion"
+
+
+@pytest.mark.anyio
+async def test_post_stage_processing_error_cleans_up_staged_file(
+    app_container: CrawlTestContainer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def explode_metadata(**kwargs: object) -> ContentMetadata:
+        raise RuntimeError("metadata explosion")
+
+    monkeypatch.setattr(
+        app_container.orchestrator._storage,
+        "persist_metadata",
+        explode_metadata,
+    )
+
+    await app_container.orchestrator.process_url(
+        url_id=app_container.seed_url_id,
+        worker_id="worker-a",
+    )
+
+    artifact = await app_container.async_session.scalar(
+        select(ContentArtifact).where(ContentArtifact.crawl_url_id == app_container.seed_url_id)
+    )
+    saved_files = list((Path("output") / "html").glob("*"))
+
+    assert artifact is None
+    assert saved_files == []
+
+
+@pytest.mark.anyio
 async def test_fetch_exception_persists_retry_attempt(
     app_container: CrawlTestContainer,
     monkeypatch: pytest.MonkeyPatch,
@@ -513,17 +575,17 @@ async def test_pause_request_at_artifact_boundary_waits_for_successful_writes(
 ) -> None:
     artifact_boundary_reached = asyncio.Event()
     allow_artifact_persistence = asyncio.Event()
-    original_persist_artifact = app_container.orchestrator._storage.persist_artifact
+    original_stage_artifact = app_container.orchestrator._storage.stage_artifact
 
-    async def persist_artifact_after_pause_request(**kwargs: object) -> ContentArtifact:
+    async def stage_artifact_after_pause_request(**kwargs: object) -> ContentArtifact:
         artifact_boundary_reached.set()
         await allow_artifact_persistence.wait()
-        return await original_persist_artifact(**kwargs)
+        return await original_stage_artifact(**kwargs)
 
     monkeypatch.setattr(
         app_container.orchestrator._storage,
-        "persist_artifact",
-        persist_artifact_after_pause_request,
+        "stage_artifact",
+        stage_artifact_after_pause_request,
     )
 
     async def request_pause() -> None:
@@ -564,3 +626,36 @@ async def test_pause_request_at_artifact_boundary_waits_for_successful_writes(
     assert artifact is not None
     assert metadata is not None
     assert discoveries
+
+
+@pytest.mark.anyio
+async def test_stale_claim_after_staging_cleans_up_staged_file(
+    app_container: CrawlTestContainer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def reject_final_write(**kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        app_container.orchestrator._urls,
+        "mark_done",
+        reject_final_write,
+    )
+
+    await app_container.orchestrator.process_url(
+        url_id=app_container.seed_url_id,
+        worker_id="worker-a",
+    )
+
+    artifact = await app_container.async_session.scalar(
+        select(ContentArtifact).where(ContentArtifact.crawl_url_id == app_container.seed_url_id)
+    )
+    saved_files = list((Path("output") / "html").glob("*"))
+    attempt = await app_container.async_session.scalar(
+        select(CrawlAttempt).where(CrawlAttempt.crawl_url_id == app_container.seed_url_id)
+    )
+
+    assert artifact is None
+    assert saved_files == []
+    assert attempt is not None
+    assert attempt.result_status == "in_progress"

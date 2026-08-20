@@ -88,35 +88,61 @@ async def _process_wakeup(
     worker_id: str,
 ) -> None:
     async with session_factory() as session:
-        async with session.begin():
-            urls = UrlRepository(session, lease_duration_seconds=settings.lease_duration_seconds)
-            claimed = await urls.claim_runnable_urls(
+        urls = UrlRepository(session, lease_duration_seconds=settings.lease_duration_seconds)
+        claimed = await urls.claim_runnable_urls(
+            worker_id=worker_id,
+            limit=settings.crawler_batch_size,
+        )
+        await session.commit()
+
+    heartbeat_tasks = {
+        row.id: asyncio.create_task(
+            heartbeat_loop(
+                session_factory=session_factory,
+                url_id=row.id,
                 worker_id=worker_id,
-                limit=settings.crawler_batch_size,
+                interval_seconds=settings.heartbeat_interval_seconds,
+                lease_duration_seconds=settings.lease_duration_seconds,
             )
-            orchestrator = CrawlOrchestrator(
-                fetch_client=FetchClient(http_client),
-                storage=ArtifactStorage(root=settings.artifact_root, session=session),
-                processors=ProcessorRegistry(),
-                jobs=JobRepository(session),
-                urls=urls,
-                discoveries=DiscoveryRepository(session),
-                attempts=AttemptRepository(session),
-            )
-            for row in claimed:
-                heartbeat_task = asyncio.create_task(
-                    heartbeat_loop(
-                        session_factory=session_factory,
-                        url_id=row.id,
-                        worker_id=worker_id,
-                        interval_seconds=settings.heartbeat_interval_seconds,
+        )
+        for row in claimed
+    }
+
+    for row in claimed:
+        try:
+            async with session_factory() as processing_session:
+                orchestrator = CrawlOrchestrator(
+                    session=processing_session,
+                    fetch_client=FetchClient(http_client),
+                    storage=ArtifactStorage(root=settings.artifact_root, session=processing_session),
+                    processors=ProcessorRegistry(),
+                    jobs=JobRepository(processing_session),
+                    urls=UrlRepository(
+                        processing_session,
                         lease_duration_seconds=settings.lease_duration_seconds,
-                    )
+                    ),
+                    discoveries=DiscoveryRepository(processing_session),
+                    attempts=AttemptRepository(processing_session),
                 )
-                try:
-                    await orchestrator.process_url(url_id=row.id, worker_id=worker_id)
-                finally:
-                    heartbeat_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await heartbeat_task
-            logger.info("processed crawler wakeup", extra={"claimed_urls": len(claimed)})
+                await orchestrator.process_url(url_id=row.id, worker_id=worker_id)
+        finally:
+            heartbeat_task = heartbeat_tasks.pop(row.id)
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
+    for heartbeat_task in heartbeat_tasks.values():
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+    logger.info("processed crawler wakeup", extra={"claimed_urls": len(claimed)})
+
+
+def main() -> None:
+    from crawler.logging import configure_logging
+
+    configure_logging()
+    asyncio.run(run_crawler_worker())
+
+
+if __name__ == "__main__":
+    main()

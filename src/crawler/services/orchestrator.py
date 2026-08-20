@@ -6,6 +6,7 @@ from typing import Iterable
 from uuid import UUID
 
 from bs4 import BeautifulSoup
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from crawler.domain.retry_policy import compute_next_retry_at
 from crawler.domain.url_policy import is_same_hostname, normalize_url, should_spawn_child
@@ -33,6 +34,7 @@ class CrawlOrchestrator:
     def __init__(
         self,
         *,
+        session: AsyncSession,
         fetch_client: FetchClient,
         storage: ArtifactStorage,
         processors: ProcessorRegistry,
@@ -41,6 +43,7 @@ class CrawlOrchestrator:
         discoveries: DiscoveryRepository,
         attempts: AttemptRepository,
     ) -> None:
+        self._session = session
         self._fetch_client = fetch_client
         self._storage = storage
         self._processors = processors
@@ -63,187 +66,234 @@ class CrawlOrchestrator:
         url_row = await self._urls.mark_fetching(url_id=url_id, worker_id=worker_id)
         if url_row is None:
             return
+        url_row_id = url_row.id
+        job_id = url_row.job_id
+        normalized_url = url_row.normalized_url
+        fetch_attempts = url_row.fetch_attempts
+        job_config = dict(job.config)
         attempt = await self._attempts.start_attempt(
-            crawl_url_id=url_row.id,
-            attempt_number=url_row.fetch_attempts + 1,
+            crawl_url_id=url_row_id,
         )
+        attempt_id = attempt.id
+        await self._session.commit()
 
         try:
-            response = await self._fetch_client.fetch(url_row.normalized_url)
+            response = await self._fetch_client.fetch(normalized_url)
         except Exception as error:
             result_status = await self._mark_transient_failure(
-                url_row=url_row,
-                job=job,
+                url_id=url_row_id,
                 worker_id=worker_id,
+                fetch_attempts=fetch_attempts,
+                job_config=job_config,
                 http_status_code=None,
                 error_code="fetch_error",
                 error_detail=str(error),
             )
             if result_status is None:
+                await self._session.rollback()
                 return
             await self._finish_attempt(
-                attempt=attempt,
+                attempt_id=attempt_id,
                 result_status=result_status,
                 http_status_code=None,
                 retry_after_seconds=None,
                 response_headers=None,
                 error_detail=str(error),
             )
+            await self._session.commit()
             return
 
         if response.status_code == 404:
             transitioned = await self._mark_permanent_failure(
-                url_id=url_id,
+                url_id=url_row_id,
                 worker_id=worker_id,
                 http_status_code=404,
                 error_code="not_found",
                 error_detail="404",
             )
             if not transitioned:
+                await self._session.rollback()
                 return
             await self._finish_attempt(
-                attempt=attempt,
+                attempt_id=attempt_id,
                 result_status=UrlStatus.FAILED_PERMANENT.value,
                 http_status_code=404,
                 retry_after_seconds=None,
                 response_headers=response.headers,
                 error_detail="404",
             )
+            await self._session.commit()
             return
         if response.status_code == 403:
             transitioned = await self._mark_permanent_failure(
-                url_id=url_id,
+                url_id=url_row_id,
                 worker_id=worker_id,
                 http_status_code=403,
                 error_code="blocked",
                 error_detail="403",
             )
             if not transitioned:
+                await self._session.rollback()
                 return
             await self._finish_attempt(
-                attempt=attempt,
+                attempt_id=attempt_id,
                 result_status=UrlStatus.FAILED_PERMANENT.value,
                 http_status_code=403,
                 retry_after_seconds=None,
                 response_headers=response.headers,
                 error_detail="403",
             )
+            await self._session.commit()
             return
         if response.status_code == 429:
-            retry_after_seconds = _retry_after_seconds(response.headers, job.config)
+            retry_after_seconds = _retry_after_seconds(response.headers, job_config)
             result_status = await self._mark_transient_failure(
-                url_row=url_row,
-                job=job,
+                url_id=url_row_id,
                 worker_id=worker_id,
+                fetch_attempts=fetch_attempts,
+                job_config=job_config,
                 http_status_code=429,
                 error_code="rate_limited",
                 error_detail="retry after",
                 retry_after_seconds=retry_after_seconds,
             )
             if result_status is None:
+                await self._session.rollback()
                 return
             await self._finish_attempt(
-                attempt=attempt,
+                attempt_id=attempt_id,
                 result_status=result_status,
                 http_status_code=429,
                 retry_after_seconds=retry_after_seconds,
                 response_headers=response.headers,
                 error_detail="retry after",
             )
+            await self._session.commit()
             return
         if response.status_code == 500:
             result_status = await self._mark_transient_failure(
-                url_row=url_row,
-                job=job,
+                url_id=url_row_id,
                 worker_id=worker_id,
+                fetch_attempts=fetch_attempts,
+                job_config=job_config,
                 http_status_code=500,
                 error_code="server_error",
                 error_detail="500",
             )
             if result_status is None:
+                await self._session.rollback()
                 return
             await self._finish_attempt(
-                attempt=attempt,
+                attempt_id=attempt_id,
                 result_status=result_status,
                 http_status_code=500,
                 retry_after_seconds=None,
                 response_headers=response.headers,
                 error_detail="500",
             )
+            await self._session.commit()
             return
         if response.status_code != 200:
             result_status = await self._mark_transient_failure(
-                url_row=url_row,
-                job=job,
+                url_id=url_row_id,
                 worker_id=worker_id,
+                fetch_attempts=fetch_attempts,
+                job_config=job_config,
                 http_status_code=response.status_code,
                 error_code="unexpected_status",
                 error_detail=str(response.status_code),
             )
             if result_status is None:
+                await self._session.rollback()
                 return
             await self._finish_attempt(
-                attempt=attempt,
+                attempt_id=attempt_id,
                 result_status=result_status,
                 http_status_code=response.status_code,
                 retry_after_seconds=None,
                 response_headers=response.headers,
                 error_detail=str(response.status_code),
             )
+            await self._session.commit()
             return
 
         try:
+            content_type = _content_type_from_headers(response.headers)
+            processor = self._processors.processor_for(content_type)
+            body = response.body or b""
+            metadata = processor.extract_metadata(body, response.headers)
+            locked_job = await self._jobs.lock_running_job(job_id)
+            if locked_job is None:
+                await self._session.rollback()
+                return
+            staged_artifact = await self._storage.stage_artifact(
+                job_id=job_id,
+                crawl_url_id=url_row_id,
+                content_type=content_type,
+                url=normalized_url,
+                body=body,
+                headers=response.headers,
+            )
             processed = await self._process_success_response(
                 url_row=url_row,
                 response=response,
+                content_type=content_type,
+                metadata=metadata,
+                staged_artifact=staged_artifact,
                 worker_id=worker_id,
             )
         except Exception as error:
+            if "staged_artifact" in locals():
+                await self._storage.delete_staged_artifact(storage_path=staged_artifact.storage_path)
+            await self._session.rollback()
             result_status = await self._mark_transient_failure(
-                url_row=url_row,
-                job=job,
+                url_id=url_row_id,
                 worker_id=worker_id,
+                fetch_attempts=fetch_attempts,
+                job_config=job_config,
                 http_status_code=response.status_code,
                 error_code="processing_error",
                 error_detail=str(error),
             )
             if result_status is None:
+                await self._session.rollback()
                 return
             await self._finish_attempt(
-                attempt=attempt,
+                attempt_id=attempt_id,
                 result_status=result_status,
                 http_status_code=response.status_code,
                 retry_after_seconds=None,
                 response_headers=response.headers,
                 error_detail=str(error),
             )
+            await self._session.commit()
             return
 
         if not processed:
+            await self._storage.delete_staged_artifact(storage_path=staged_artifact.storage_path)
+            await self._session.rollback()
             return
 
         await self._finish_attempt(
-            attempt=attempt,
+            attempt_id=attempt_id,
             result_status="success",
             http_status_code=response.status_code,
             retry_after_seconds=None,
             response_headers=response.headers,
             error_detail=None,
         )
+        await self._session.commit()
 
     async def _process_success_response(
         self,
         *,
         url_row: CrawlUrl,
         response: FetchResponse,
+        content_type: str,
+        metadata: dict[str, object],
+        staged_artifact,
         worker_id: str,
     ) -> bool:
-        job = await self._jobs.lock_running_job(url_row.job_id)
-        if job is None:
-            return False
-
-        content_type = _content_type_from_headers(response.headers)
-        processor = self._processors.processor_for(content_type)
         if not await self._urls.mark_processing(
             url_id=url_row.id,
             worker_id=worker_id,
@@ -252,31 +302,24 @@ class CrawlOrchestrator:
         ):
             return False
 
-        body = response.body or b""
-        metadata = processor.extract_metadata(body, response.headers)
-        artifact = await self._storage.persist_artifact(
-            job_id=url_row.job_id,
-            crawl_url_id=url_row.id,
-            content_type=content_type,
-            url=url_row.normalized_url,
-            body=body,
-            headers=response.headers,
-        )
+        artifact = staged_artifact
+        self._session.add(artifact)
+        await self._session.flush()
         await self._storage.persist_metadata(
-            artifact_id=artifact.id,
-            metadata_type=processor.metadata_type,
+            artifact_id=artifact.id,  # type: ignore[attr-defined]
+            metadata_type=self._processors.processor_for(content_type).metadata_type,
             metadata=metadata,
         )
         await self.discover_links(
             job_id=url_row.job_id,
             source_url_id=url_row.id,
             source_url=url_row.normalized_url,
-            links=_html_links(body, content_type),
+            links=_html_links(response.body or b"", content_type),
         )
         if not await self._urls.mark_done(
             url_id=url_row.id,
             worker_id=worker_id,
-            content_artifact_id=artifact.id,
+            content_artifact_id=artifact.id,  # type: ignore[attr-defined]
         ):
             return False
         return True
@@ -384,19 +427,20 @@ class CrawlOrchestrator:
     async def _mark_transient_failure(
         self,
         *,
-        url_row: CrawlUrl,
-        job: CrawlJob,
+        url_id: UUID,
         worker_id: str,
+        fetch_attempts: int,
+        job_config: dict[str, object],
         http_status_code: int | None,
         error_code: str,
         error_detail: str,
         retry_after_seconds: int | None = None,
     ) -> str | None:
-        attempt_number = url_row.fetch_attempts + 1
-        max_attempts = int(job.config.get("max_attempts", 3))
+        attempt_number = fetch_attempts + 1
+        max_attempts = int(job_config.get("max_attempts", 3))
         if attempt_number >= max_attempts:
             if not await self._mark_permanent_failure(
-                url_id=url_row.id,
+                url_id=url_id,
                 worker_id=worker_id,
                 http_status_code=http_status_code,
                 error_code="retry_exhausted",
@@ -408,12 +452,12 @@ class CrawlOrchestrator:
         next_retry_at = compute_next_retry_at(
             now=datetime.now(UTC).replace(tzinfo=None),
             attempt_number=attempt_number,
-            base_backoff_seconds=int(job.config.get("base_backoff_seconds", 10)),
-            max_backoff_seconds=int(job.config.get("max_backoff_seconds", 300)),
+            base_backoff_seconds=int(job_config.get("base_backoff_seconds", 10)),
+            max_backoff_seconds=int(job_config.get("max_backoff_seconds", 300)),
             retry_after_seconds=retry_after_seconds,
         )
         if not await self._urls.mark_retry_wait(
-            url_id=url_row.id,
+            url_id=url_id,
             worker_id=worker_id,
             next_eligible_at=next_retry_at,
             error_code=error_code,
@@ -426,7 +470,7 @@ class CrawlOrchestrator:
     async def _finish_attempt(
         self,
         *,
-        attempt: CrawlAttempt,
+        attempt_id: UUID,
         result_status: str,
         http_status_code: int | None,
         retry_after_seconds: int | None,
@@ -434,7 +478,7 @@ class CrawlOrchestrator:
         error_detail: str | None,
     ) -> None:
         await self._attempts.finish_attempt(
-            attempt=attempt,
+            attempt_id=attempt_id,
             result_status=result_status,
             http_status_code=http_status_code,
             retry_after_seconds=retry_after_seconds,

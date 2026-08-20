@@ -25,6 +25,10 @@ class ArtifactStorage:
         url_hash = hashlib.sha256(normalized_url.encode()).hexdigest()
         return self._root / bucket / f"{url_hash}-{content_hash}"
 
+    @property
+    def root(self) -> Path:
+        return self._root
+
     async def persist_artifact(
         self,
         *,
@@ -60,6 +64,28 @@ class ArtifactStorage:
             await self._session.flush()
         return artifact
 
+    async def stage_artifact(
+        self,
+        *,
+        job_id: UUID,
+        crawl_url_id: UUID,
+        content_type: str,
+        url: str,
+        body: bytes,
+        headers: dict[str, str],
+    ) -> ContentArtifact:
+        return await ArtifactStorage(root=self._root).persist_artifact(
+            job_id=job_id,
+            crawl_url_id=crawl_url_id,
+            content_type=content_type,
+            url=url,
+            body=body,
+            headers=headers,
+        )
+
+    async def delete_staged_artifact(self, *, storage_path: str) -> None:
+        await asyncio.to_thread(self._delete_body, Path(storage_path))
+
     async def persist_metadata(
         self,
         *,
@@ -81,6 +107,10 @@ class ArtifactStorage:
     def _write_body(path: Path, body: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(body)
+
+    @staticmethod
+    def _delete_body(path: Path) -> None:
+        path.unlink(missing_ok=True)
 
     @staticmethod
     def _bucket_for_content_type(content_type: str) -> str:

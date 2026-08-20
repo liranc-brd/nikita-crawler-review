@@ -31,3 +31,17 @@ class RabbitPublisher:
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
         )
         await self._channel.default_exchange.publish(message, routing_key=self._queue_name)
+
+
+async def publish_job_wakeup_once(
+    *,
+    rabbitmq_url: str,
+    job_id: UUID,
+    queue_name: str = JOB_WAKEUP_QUEUE,
+) -> None:
+    connection = await aio_pika.connect_robust(rabbitmq_url)
+    try:
+        channel = await connection.channel()
+        await RabbitPublisher(channel, queue_name=queue_name).publish_job_wakeup(job_id)
+    finally:
+        await connection.close()

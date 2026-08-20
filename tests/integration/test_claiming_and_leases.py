@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+import asyncio
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from crawler.config import Settings
+from crawler.db.models.attempts import CrawlAttempt
 from crawler.db.models.enums import JobStatus, UrlStatus
 from crawler.db.models.jobs import CrawlJob
 from crawler.db.models.urls import CrawlUrl
 from crawler.db.session import async_session_factory
+from crawler.repos.attempts import AttemptRepository
 from crawler.repos.jobs import JobRepository
 from crawler.repos.urls import UrlRepository
+from crawler.workers.crawler_worker import _process_wakeup
 
 
 @pytest.fixture
@@ -220,6 +225,152 @@ async def test_heartbeat_extends_only_current_workers_lease(async_session: Async
 
 
 @pytest.mark.anyio
+async def test_worker_processing_does_not_block_heartbeat_updates(
+    async_session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    url = await _create_running_job_with_seed(async_session)
+    await async_session.commit()
+    fetch_started = asyncio.Event()
+    allow_fetch_response = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params == httpx.QueryParams({"url": url.normalized_url})
+        fetch_started.set()
+        await allow_fetch_response.wait()
+        return httpx.Response(
+            200,
+            json={
+                "statusCode": 200,
+                "headers": {"Content-Type": "text/html"},
+                "body": "<html><head><title>Example</title></head><body></body></html>",
+            },
+        )
+
+    settings = Settings(
+        heartbeat_interval_seconds=1,
+        lease_duration_seconds=30,
+        artifact_root=tmp_path / "artifacts",
+    )
+    worker_task = None
+    async with httpx.AsyncClient(
+        base_url="http://mock-api.mock.com",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        monkeypatch.setattr("crawler.workers.crawler_worker.Settings", lambda: settings)
+        worker_task = asyncio.create_task(
+            _process_wakeup(
+                session_factory=session_factory,
+                http_client=http_client,
+                settings=settings,
+                worker_id="worker-a",
+            )
+        )
+        await asyncio.wait_for(fetch_started.wait(), timeout=1)
+
+        async with session_factory() as heartbeat_session:
+            updated = await asyncio.wait_for(
+                UrlRepository(heartbeat_session).heartbeat_url(
+                    url_id=url.id,
+                    worker_id="worker-a",
+                    lease_duration_seconds=30,
+                    now=datetime(2026, 8, 20, 12, 0, 0),
+                ),
+                timeout=0.5,
+            )
+            await heartbeat_session.commit()
+
+        async with session_factory() as verification_session:
+            refreshed_during_processing = await verification_session.get(CrawlUrl, url.id)
+
+        allow_fetch_response.set()
+        await asyncio.wait_for(worker_task, timeout=2)
+
+    assert updated is True
+    assert refreshed_during_processing is not None
+    assert refreshed_during_processing.last_heartbeat_at == datetime(2026, 8, 20, 12, 0, 0)
+
+
+@pytest.mark.anyio
+async def test_worker_heartbeats_later_claimed_urls_while_earlier_work_is_processing(
+    async_session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path,
+) -> None:
+    first_url = await _create_running_job_with_seed(async_session)
+    second_url = await UrlRepository(async_session).seed_url(
+        job_id=first_url.job_id,
+        seed_url=f"{first_url.normalized_url}second",
+    )
+    await async_session.commit()
+
+    processing_started = asyncio.Event()
+    allow_processing = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "statusCode": 200,
+                "headers": {"Content-Type": "text/html"},
+                "body": "<html><head><title>Example</title></head><body></body></html>",
+            },
+        )
+
+    settings = Settings(
+        crawler_batch_size=2,
+        heartbeat_interval_seconds=1,
+        lease_duration_seconds=30,
+        artifact_root=tmp_path / "artifacts",
+    )
+    async with httpx.AsyncClient(
+        base_url="http://mock-api.mock.com",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        original_process_url = _process_wakeup.__globals__["CrawlOrchestrator"].process_url
+
+        async def blocking_process_url(self, *, url_id: UUID, worker_id: str) -> None:
+            processing_started.set()
+            await allow_processing.wait()
+            await original_process_url(self, url_id=url_id, worker_id=worker_id)
+
+        _process_wakeup.__globals__["CrawlOrchestrator"].process_url = blocking_process_url
+        worker_task = asyncio.create_task(
+            _process_wakeup(
+                session_factory=session_factory,
+                http_client=http_client,
+                settings=settings,
+                worker_id="worker-a",
+            )
+        )
+        try:
+            await asyncio.wait_for(processing_started.wait(), timeout=1)
+            await asyncio.sleep(1.1)
+
+            async with session_factory() as verification_session:
+                refreshed_urls = (
+                    await verification_session.scalars(
+                        select(CrawlUrl)
+                        .where(CrawlUrl.id.in_((first_url.id, second_url.id)))
+                        .order_by(CrawlUrl.id)
+                    )
+                ).all()
+
+            allow_processing.set()
+            await asyncio.wait_for(worker_task, timeout=2)
+        finally:
+            _process_wakeup.__globals__["CrawlOrchestrator"].process_url = original_process_url
+
+    claimed_urls = [url for url in refreshed_urls if url.status is UrlStatus.CLAIMED]
+    assert len(claimed_urls) == 2
+    assert all(url.last_heartbeat_at is not None for url in claimed_urls)
+    assert all(url.claimed_at is not None for url in claimed_urls)
+    assert all(url.last_heartbeat_at > url.claimed_at for url in claimed_urls)
+
+
+@pytest.mark.anyio
 async def test_mark_retry_wait_releases_the_claim_and_records_error(async_session: AsyncSession) -> None:
     url = await _create_running_job_with_seed(async_session)
     url.status = UrlStatus.CLAIMED
@@ -273,6 +424,40 @@ async def test_mark_retry_wait_rejects_a_stale_worker_after_reclaim(
     assert url.status is UrlStatus.CLAIMED
     assert url.claimed_by == "worker-b"
     assert url.fetch_attempts == 0
+
+
+@pytest.mark.anyio
+async def test_release_expired_leases_finishes_abandoned_attempts_and_next_attempt_number_advances(
+    async_session: AsyncSession,
+) -> None:
+    url = await _create_running_job_with_seed(async_session)
+    frozen_now = datetime(2026, 8, 20, 12, 0, 0)
+    url.status = UrlStatus.FETCHING
+    url.claimed_by = "dead-worker"
+    url.claimed_at = frozen_now - timedelta(minutes=2)
+    url.last_heartbeat_at = frozen_now - timedelta(minutes=2)
+    url.lease_expires_at = frozen_now - timedelta(seconds=1)
+    first_attempt = CrawlAttempt(
+        crawl_url_id=url.id,
+        attempt_number=1,
+        started_at=frozen_now - timedelta(minutes=2),
+        result_status="in_progress",
+    )
+    async_session.add(first_attempt)
+    await async_session.commit()
+
+    released = await UrlRepository(async_session).release_expired_leases(now=frozen_now)
+    await async_session.refresh(first_attempt)
+
+    reclaimed = await UrlRepository(async_session).claim_runnable_urls(worker_id="worker-b", limit=1)
+    next_attempt = await AttemptRepository(async_session).start_attempt(crawl_url_id=url.id)
+
+    assert released == 1
+    assert first_attempt.finished_at == frozen_now
+    assert first_attempt.result_status == "abandoned"
+    assert first_attempt.error_detail == "lease expired"
+    assert len(reclaimed) == 1
+    assert next_attempt.attempt_number == 2
 
 
 @pytest.mark.anyio

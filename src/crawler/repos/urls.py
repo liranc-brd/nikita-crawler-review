@@ -8,6 +8,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from crawler.db.models.attempts import CrawlAttempt
 from crawler.db.models.enums import JobStatus, UrlStatus
 from crawler.db.models.jobs import CrawlJob
 from crawler.db.models.urls import CrawlUrl
@@ -234,8 +235,22 @@ class UrlRepository:
             )
             .returning(CrawlUrl.id)
         )
+        released_ids = list(result.scalars().all())
+        if released_ids:
+            await self._session.execute(
+                update(CrawlAttempt)
+                .where(
+                    CrawlAttempt.crawl_url_id.in_(released_ids),
+                    CrawlAttempt.finished_at.is_(None),
+                )
+                .values(
+                    finished_at=now,
+                    result_status="abandoned",
+                    error_detail="lease expired",
+                )
+            )
         await self._session.flush()
-        return len(result.scalars().all())
+        return len(released_ids)
 
     async def mark_retry_wait(
         self,

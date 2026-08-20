@@ -56,3 +56,14 @@ async def run_scheduler_worker() -> None:
     while True:
         await reconcile_once(_utcnow())
         await asyncio.sleep(settings.scheduler_poll_interval_seconds)
+
+
+def main() -> None:
+    from crawler.logging import configure_logging
+
+    configure_logging()
+    asyncio.run(run_scheduler_worker())
+
+
+if __name__ == "__main__":
+    main()

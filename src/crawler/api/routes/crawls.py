@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import logging
+from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from crawler.api.dependencies import get_job_repository, get_session, get_url_repository
+from crawler.api.dependencies import get_job_repository, get_session
 from crawler.api.schemas import (
     CrawlAttemptResponse,
     CrawlProgressResponse,
@@ -15,29 +17,43 @@ from crawler.api.schemas import (
     DiscoveredUrlResponse,
     DiscoveryResponse,
 )
+from crawler.config import Settings
 from crawler.db.models.attempts import CrawlAttempt
+from crawler.db.models.enums import JobStatus, UrlStatus
 from crawler.db.models.discoveries import DiscoveredLink
-from crawler.db.models.enums import UrlStatus
 from crawler.db.models.jobs import CrawlJob
 from crawler.db.models.urls import CrawlUrl
+from crawler.messaging.rabbitmq import publish_job_wakeup_once
 from crawler.repos.jobs import JobRepository
 from crawler.repos.urls import UrlRepository
 
 
 router = APIRouter(prefix="/crawls")
+logger = logging.getLogger(__name__)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=CrawlStatusResponse)
 async def create_crawl(
     payload: CreateCrawlRequest,
-    jobs: JobRepository = Depends(get_job_repository),
-    urls: UrlRepository = Depends(get_url_repository),
+    session: AsyncSession = Depends(get_session),
 ) -> CrawlStatusResponse:
+    jobs = JobRepository(session)
+    urls = UrlRepository(session)
     job = await jobs.create_job(
         seed_url=str(payload.seed_url),
         config={"max_attempts": 3, "child_rules": payload.child_rules},
     )
+    job.status = JobStatus.RUNNING
+    job.started_at = datetime.now(UTC).replace(tzinfo=None)
     await urls.seed_url(job_id=job.id, seed_url=job.seed_url)
+    await session.commit()
+    try:
+        await publish_job_wakeup_once(
+            rabbitmq_url=Settings().rabbitmq_url,
+            job_id=job.id,
+        )
+    except Exception:
+        logger.warning("failed to publish initial crawl wakeup", extra={"job_id": str(job.id)})
     return _crawl_status_response(job)
 
 

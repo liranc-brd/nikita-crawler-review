@@ -80,7 +80,10 @@ async def test_job_schema_persists_seed_job(async_session) -> None:
 
 
 @pytest.mark.anyio
-async def test_post_crawls_creates_seed_job_and_seed_url(async_client: httpx.AsyncClient) -> None:
+async def test_post_crawls_creates_seed_job_and_seed_url(
+    async_client: httpx.AsyncClient,
+    async_session: AsyncSession,
+) -> None:
     response = await async_client.post(
         "/crawls",
         json={"seed_url": "https://example.com", "child_rules": []},
@@ -88,9 +91,21 @@ async def test_post_crawls_creates_seed_job_and_seed_url(async_client: httpx.Asy
 
     assert response.status_code == 201
     payload = response.json()
-    assert payload["status"] == "pending"
+    assert payload["status"] == "running"
+    assert payload["started_at"] is not None
 
-    await _delete_job(UUID(payload["id"]))
+    job_id = UUID(payload["id"])
+    try:
+        job = await async_session.get(CrawlJob, job_id)
+        seed_url = await async_session.scalar(select(CrawlUrl).where(CrawlUrl.job_id == job_id))
+
+        assert job is not None
+        assert job.status is JobStatus.RUNNING
+        assert job.started_at is not None
+        assert seed_url is not None
+        assert seed_url.status is UrlStatus.QUEUED
+    finally:
+        await _delete_job(job_id)
 
 
 @pytest.mark.anyio
