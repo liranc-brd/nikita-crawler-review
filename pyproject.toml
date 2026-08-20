@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crawler"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic>=2.8",
+  "pydantic-settings",
+  "sqlalchemy>=2.0",
+  "asyncpg",
+  "alembic",
+  "aio-pika",
+  "httpx",
+  "beautifulsoup4",
+  "pillow",
+  "pypdf",
+  "pymediainfo",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[project.scripts]
+crawler = "crawler.main:run"
