@@ -127,3 +127,7 @@ GREEN verification:
 ### Concerns
 
 None.
+
+### Commit
+
+Fix Round 1 implementation committed as `4047b32 fix: harden crawl state transitions`.
