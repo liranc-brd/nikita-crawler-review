@@ -234,6 +234,9 @@ class CrawlOrchestrator:
                 body=body,
                 headers=response.headers,
             )
+            await self._storage.lock_storage_path(
+                storage_path=staged_artifact.artifact.storage_path
+            )
             created_storage_path = await self._storage.promote_staged_artifact(staged_artifact)
             processed = await self._process_success_response(
                 url_row=url_row,

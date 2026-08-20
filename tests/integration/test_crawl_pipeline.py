@@ -487,6 +487,48 @@ async def test_post_stage_cleanup_does_not_delete_committed_artifact_from_anothe
 
 
 @pytest.mark.anyio
+async def test_concurrent_shared_storage_path_waits_for_failed_creator_before_successor_commits(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    storage_path = str(tmp_path / "output" / "html" / "shared-artifact")
+    first_acquired = asyncio.Event()
+    second_acquired = asyncio.Event()
+    allow_first_release = asyncio.Event()
+
+    async with session_factory() as first_session:
+        async with session_factory() as second_session:
+            first_storage = ArtifactStorage(root=tmp_path / "output", session=first_session)
+            second_storage = ArtifactStorage(root=tmp_path / "output", session=second_session)
+
+            async def hold_first_lock() -> None:
+                await first_storage.lock_storage_path(storage_path=storage_path)
+                first_acquired.set()
+                await allow_first_release.wait()
+                await first_session.rollback()
+
+            async def await_second_lock() -> None:
+                await second_storage.lock_storage_path(storage_path=storage_path)
+                second_acquired.set()
+                await second_session.rollback()
+
+            first_task = asyncio.create_task(hold_first_lock())
+            await asyncio.wait_for(first_acquired.wait(), timeout=1)
+
+            second_task = asyncio.create_task(await_second_lock())
+            await asyncio.sleep(0.2)
+
+            assert second_acquired.is_set() is False
+            assert second_task.done() is False
+
+            allow_first_release.set()
+            await first_task
+            await asyncio.wait_for(second_task, timeout=1)
+
+    assert second_acquired.is_set() is True
+
+
+@pytest.mark.anyio
 async def test_fetch_exception_persists_retry_attempt(
     app_container: CrawlTestContainer,
     monkeypatch: pytest.MonkeyPatch,

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from crawler.db.models.artifacts import ContentArtifact
@@ -113,6 +114,14 @@ class ArtifactStorage:
             self._promote_body,
             staged_artifact.staging_path,
             final_path,
+        )
+
+    async def lock_storage_path(self, *, storage_path: str) -> None:
+        if self._session is None:
+            raise RuntimeError("storage path locking requires a database session")
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": f"artifact-path:{storage_path}"},
         )
 
     async def delete_staged_artifact(self, staged_artifact: StagedArtifact) -> None:
