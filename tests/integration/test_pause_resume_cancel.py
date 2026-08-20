@@ -137,6 +137,47 @@ async def test_cancel_finalizes_a_url_recovered_after_cancel_request(
 
 
 @pytest.mark.anyio
+async def test_cancel_does_not_finalize_when_a_lease_recovers_during_advancement(
+    async_session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = await _create_running_job(async_session)
+    url = await UrlRepository(async_session).seed_url(job_id=job.id, seed_url=job.seed_url)
+    frozen_now = datetime(2026, 8, 20, 12, 0, 0)
+    url.status = UrlStatus.CLAIMED
+    url.claimed_by = "dead-worker"
+    url.lease_expires_at = frozen_now - timedelta(seconds=1)
+    await async_session.commit()
+
+    jobs = JobRepository(async_session)
+    await jobs.request_cancel(job.id)
+    original_execute = async_session.execute
+    execution_count = 0
+
+    async def execute_with_recovery(*args, **kwargs):
+        nonlocal execution_count
+        execution_count += 1
+        if execution_count == 3:
+            async with session_factory() as recovery_session:
+                released = await UrlRepository(recovery_session).release_expired_leases(
+                    now=frozen_now
+                )
+                await recovery_session.commit()
+            assert released == 1
+        return await original_execute(*args, **kwargs)
+
+    monkeypatch.setattr(async_session, "execute", execute_with_recovery)
+    result = await jobs.advance_lifecycle_states(now=frozen_now)
+    await async_session.refresh(job)
+    await async_session.refresh(url)
+
+    assert result.canceled_jobs == 0
+    assert job.status is JobStatus.CANCELING
+    assert url.status is UrlStatus.QUEUED
+
+
+@pytest.mark.anyio
 async def test_mark_completed_if_drained_waits_for_runnable_urls(async_session: AsyncSession) -> None:
     job = await _create_running_job(async_session)
     url = await UrlRepository(async_session).seed_url(job_id=job.id, seed_url=job.seed_url)

@@ -131,3 +131,38 @@ None.
 ### Commit
 
 Fix Round 1 implementation committed as `4047b32 fix: harden crawl state transitions`.
+
+## Fix Round 2
+
+### Implemented
+
+- Changed `CANCELING -> CANCELED` finalization to require no non-terminal URL
+  rows. The terminal-frontier predicate is shared with drained-job completion.
+- Kept the existing cancellation frontier update, claim lock narrowing, and
+  stale-worker retry ownership guard unchanged.
+
+### Regression Coverage
+
+- Added a real two-session integration regression that releases an expired
+  lease after cancellation's frontier update and before its final job update.
+  The job remains `canceling` and the recovered URL remains `queued`, rather
+  than producing a canceled job with queued work.
+
+### TDD Evidence
+
+RED command:
+
+`DATABASE_URL=postgresql+asyncpg://crawler:crawler@localhost:5432/crawler RABBITMQ_URL=amqp://guest:guest@localhost:5672/ venv/bin/pytest tests/integration/test_pause_resume_cancel.py::test_cancel_does_not_finalize_when_a_lease_recovers_during_advancement -v`
+
+Result: failed as expected with `canceled_jobs == 1`; the old finalization
+predicate ignored the recovered queued URL.
+
+GREEN verification:
+
+- Focused cancellation race regression: `1 passed`.
+- Covering Task 4 integration suite: `17 passed`.
+- Full project suite: `31 passed`.
+
+### Concerns
+
+None.

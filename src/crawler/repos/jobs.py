@@ -133,6 +133,7 @@ class JobRepository:
             )
         )
         active_urls_exist = self._active_urls_exist()
+        unresolved_urls_exist = self._unresolved_urls_exist()
         paused = await self._session.execute(
             update(CrawlJob)
             .where(CrawlJob.status == JobStatus.PAUSING, ~active_urls_exist)
@@ -141,7 +142,7 @@ class JobRepository:
         )
         canceled = await self._session.execute(
             update(CrawlJob)
-            .where(CrawlJob.status == JobStatus.CANCELING, ~active_urls_exist)
+            .where(CrawlJob.status == JobStatus.CANCELING, ~unresolved_urls_exist)
             .values(status=JobStatus.CANCELED, finished_at=now)
             .returning(CrawlJob.id)
         )
@@ -179,7 +180,17 @@ class JobRepository:
 
     @staticmethod
     def _complete_drained_jobs_stmt(*, now: datetime):
-        unresolved_urls_exist = (
+        unresolved_urls_exist = JobRepository._unresolved_urls_exist()
+        return (
+            update(CrawlJob)
+            .where(CrawlJob.status == JobStatus.RUNNING, ~unresolved_urls_exist)
+            .values(status=JobStatus.COMPLETED, finished_at=now)
+            .returning(CrawlJob.id)
+        )
+
+    @staticmethod
+    def _unresolved_urls_exist():
+        return (
             exists(
                 select(1).where(
                     CrawlUrl.job_id == CrawlJob.id,
@@ -187,10 +198,4 @@ class JobRepository:
                 )
             )
             .correlate(CrawlJob)
-        )
-        return (
-            update(CrawlJob)
-            .where(CrawlJob.status == JobStatus.RUNNING, ~unresolved_urls_exist)
-            .values(status=JobStatus.COMPLETED, finished_at=now)
-            .returning(CrawlJob.id)
         )
