@@ -371,6 +371,78 @@ async def test_worker_heartbeats_later_claimed_urls_while_earlier_work_is_proces
 
 
 @pytest.mark.anyio
+async def test_worker_cancels_all_heartbeats_when_processing_raises(
+    async_session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path,
+) -> None:
+    first_url = await _create_running_job_with_seed(async_session)
+    second_url = await UrlRepository(async_session).seed_url(
+        job_id=first_url.job_id,
+        seed_url=f"{first_url.normalized_url}second",
+    )
+    await async_session.commit()
+
+    processing_started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "statusCode": 200,
+                "headers": {"Content-Type": "text/html"},
+                "body": "<html><head><title>Example</title></head><body></body></html>",
+            },
+        )
+
+    settings = Settings(
+        crawler_batch_size=2,
+        heartbeat_interval_seconds=1,
+        lease_duration_seconds=30,
+        artifact_root=tmp_path / "artifacts",
+    )
+    async with httpx.AsyncClient(
+        base_url="http://mock-api.mock.com",
+        transport=httpx.MockTransport(handler),
+    ) as http_client:
+        original_process_url = _process_wakeup.__globals__["CrawlOrchestrator"].process_url
+
+        async def exploding_process_url(self, *, url_id: UUID, worker_id: str) -> None:
+            processing_started.set()
+            raise RuntimeError("boom")
+
+        _process_wakeup.__globals__["CrawlOrchestrator"].process_url = exploding_process_url
+        worker_task = asyncio.create_task(
+            _process_wakeup(
+                session_factory=session_factory,
+                http_client=http_client,
+                settings=settings,
+                worker_id="worker-a",
+            )
+        )
+        try:
+            await asyncio.wait_for(processing_started.wait(), timeout=1)
+            with pytest.raises(RuntimeError, match="boom"):
+                await asyncio.wait_for(worker_task, timeout=1)
+            await asyncio.sleep(1.1)
+
+            async with session_factory() as verification_session:
+                refreshed_urls = (
+                    await verification_session.scalars(
+                        select(CrawlUrl)
+                        .where(CrawlUrl.id.in_((first_url.id, second_url.id)))
+                        .order_by(CrawlUrl.id)
+                    )
+                ).all()
+        finally:
+            _process_wakeup.__globals__["CrawlOrchestrator"].process_url = original_process_url
+
+    claimed_urls = [url for url in refreshed_urls if url.status is UrlStatus.CLAIMED]
+    assert len(claimed_urls) == 2
+    assert all(url.last_heartbeat_at == url.claimed_at for url in claimed_urls)
+
+
+@pytest.mark.anyio
 async def test_mark_retry_wait_releases_the_claim_and_records_error(async_session: AsyncSession) -> None:
     url = await _create_running_job_with_seed(async_session)
     url.status = UrlStatus.CLAIMED
@@ -458,6 +530,35 @@ async def test_release_expired_leases_finishes_abandoned_attempts_and_next_attem
     assert first_attempt.error_detail == "lease expired"
     assert len(reclaimed) == 1
     assert next_attempt.attempt_number == 2
+
+
+@pytest.mark.anyio
+async def test_release_expired_leases_counts_abandoned_attempt_toward_fetch_attempts(
+    async_session: AsyncSession,
+) -> None:
+    url = await _create_running_job_with_seed(async_session)
+    frozen_now = datetime(2026, 8, 20, 12, 0, 0)
+    url.status = UrlStatus.FETCHING
+    url.claimed_by = "dead-worker"
+    url.claimed_at = frozen_now - timedelta(minutes=2)
+    url.last_heartbeat_at = frozen_now - timedelta(minutes=2)
+    url.lease_expires_at = frozen_now - timedelta(seconds=1)
+    async_session.add(
+        CrawlAttempt(
+            crawl_url_id=url.id,
+            attempt_number=1,
+            started_at=frozen_now - timedelta(minutes=2),
+            result_status="in_progress",
+        )
+    )
+    await async_session.commit()
+
+    released = await UrlRepository(async_session).release_expired_leases(now=frozen_now)
+    await async_session.refresh(url)
+
+    assert released == 1
+    assert url.status is UrlStatus.QUEUED
+    assert url.fetch_attempts == 1
 
 
 @pytest.mark.anyio

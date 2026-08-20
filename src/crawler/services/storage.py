@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -11,6 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from crawler.db.models.artifacts import ContentArtifact
 from crawler.db.models.metadata import ContentMetadata
 from crawler.domain.url_policy import normalize_url
+
+
+@dataclass(frozen=True)
+class StagedArtifact:
+    artifact: ContentArtifact
+    staging_path: Path
 
 
 class ArtifactStorage:
@@ -73,17 +81,44 @@ class ArtifactStorage:
         url: str,
         body: bytes,
         headers: dict[str, str],
-    ) -> ContentArtifact:
-        return await ArtifactStorage(root=self._root).persist_artifact(
+    ) -> StagedArtifact:
+        normalized_url = normalize_url(url)
+        content_hash = hashlib.sha256(body).hexdigest()
+        headers_by_name = {name.lower(): value for name, value in headers.items()}
+        final_path = self.build_storage_path(
+            content_type=content_type,
+            normalized_url=normalized_url,
+            content_hash=content_hash,
+        )
+        staging_path = final_path.with_name(
+            f"{final_path.name}.staging-{job_id.hex}-{crawl_url_id.hex}"
+        )
+        await asyncio.to_thread(self._write_body, staging_path, body)
+        artifact = ContentArtifact(
             job_id=job_id,
             crawl_url_id=crawl_url_id,
             content_type=content_type,
-            url=url,
-            body=body,
-            headers=headers,
+            storage_path=str(final_path),
+            filename=final_path.name,
+            content_length=len(body),
+            content_hash=content_hash,
+            etag=headers_by_name.get("etag"),
+            last_modified=headers_by_name.get("last-modified"),
+        )
+        return StagedArtifact(artifact=artifact, staging_path=staging_path)
+
+    async def promote_staged_artifact(self, staged_artifact: StagedArtifact) -> bool:
+        final_path = Path(staged_artifact.artifact.storage_path)
+        return await asyncio.to_thread(
+            self._promote_body,
+            staged_artifact.staging_path,
+            final_path,
         )
 
-    async def delete_staged_artifact(self, *, storage_path: str) -> None:
+    async def delete_staged_artifact(self, staged_artifact: StagedArtifact) -> None:
+        await asyncio.to_thread(self._delete_body, staged_artifact.staging_path)
+
+    async def delete_persisted_artifact(self, *, storage_path: str) -> None:
         await asyncio.to_thread(self._delete_body, Path(storage_path))
 
     async def persist_metadata(
@@ -111,6 +146,15 @@ class ArtifactStorage:
     @staticmethod
     def _delete_body(path: Path) -> None:
         path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _promote_body(staging_path: Path, final_path: Path) -> bool:
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        if final_path.exists():
+            staging_path.unlink(missing_ok=True)
+            return False
+        os.replace(staging_path, final_path)
+        return True
 
     @staticmethod
     def _bucket_for_content_type(content_type: str) -> str:

@@ -108,32 +108,34 @@ async def _process_wakeup(
         for row in claimed
     }
 
-    for row in claimed:
-        try:
-            async with session_factory() as processing_session:
-                orchestrator = CrawlOrchestrator(
-                    session=processing_session,
-                    fetch_client=FetchClient(http_client),
-                    storage=ArtifactStorage(root=settings.artifact_root, session=processing_session),
-                    processors=ProcessorRegistry(),
-                    jobs=JobRepository(processing_session),
-                    urls=UrlRepository(
-                        processing_session,
-                        lease_duration_seconds=settings.lease_duration_seconds,
-                    ),
-                    discoveries=DiscoveryRepository(processing_session),
-                    attempts=AttemptRepository(processing_session),
-                )
-                await orchestrator.process_url(url_id=row.id, worker_id=worker_id)
-        finally:
-            heartbeat_task = heartbeat_tasks.pop(row.id)
+    try:
+        for row in claimed:
+            try:
+                async with session_factory() as processing_session:
+                    orchestrator = CrawlOrchestrator(
+                        session=processing_session,
+                        fetch_client=FetchClient(http_client),
+                        storage=ArtifactStorage(root=settings.artifact_root, session=processing_session),
+                        processors=ProcessorRegistry(),
+                        jobs=JobRepository(processing_session),
+                        urls=UrlRepository(
+                            processing_session,
+                            lease_duration_seconds=settings.lease_duration_seconds,
+                        ),
+                        discoveries=DiscoveryRepository(processing_session),
+                        attempts=AttemptRepository(processing_session),
+                    )
+                    await orchestrator.process_url(url_id=row.id, worker_id=worker_id)
+            finally:
+                heartbeat_task = heartbeat_tasks.pop(row.id)
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
+    finally:
+        for heartbeat_task in heartbeat_tasks.values():
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
-    for heartbeat_task in heartbeat_tasks.values():
-        heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
     logger.info("processed crawler wakeup", extra={"claimed_urls": len(claimed)})
 
 

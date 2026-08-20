@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -432,6 +433,60 @@ async def test_post_stage_processing_error_cleans_up_staged_file(
 
 
 @pytest.mark.anyio
+async def test_post_stage_cleanup_does_not_delete_committed_artifact_from_another_job(
+    app_container: CrawlTestContainer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await app_container.orchestrator.process_url(
+        url_id=app_container.seed_url_id,
+        worker_id="worker-a",
+    )
+
+    first_artifact = await app_container.async_session.scalar(
+        select(ContentArtifact).where(ContentArtifact.crawl_url_id == app_container.seed_url_id)
+    )
+    assert first_artifact is not None
+    committed_path = Path(first_artifact.storage_path)
+    assert committed_path.exists()
+
+    second_job = await app_container.job_repo.create_job(
+        seed_url=(await app_container.async_session.get(CrawlJob, app_container.parent_job_id)).seed_url,
+        config={"max_attempts": 3, "child_rules": []},
+    )
+    second_job.status = JobStatus.RUNNING
+    second_seed = await app_container.url_repo.seed_url(
+        job_id=second_job.id,
+        seed_url=second_job.seed_url,
+    )
+    second_seed.status = UrlStatus.CLAIMED
+    second_seed.claimed_by = "worker-b"
+    second_seed_id = second_seed.id
+    app_container.async_session.info["task6_job_ids"].add(second_job.id)
+    await app_container.async_session.commit()
+
+    async def explode_metadata(**kwargs: object) -> ContentMetadata:
+        raise RuntimeError("metadata explosion")
+
+    monkeypatch.setattr(
+        app_container.orchestrator._storage,
+        "persist_metadata",
+        explode_metadata,
+    )
+
+    await app_container.orchestrator.process_url(
+        url_id=second_seed_id,
+        worker_id="worker-b",
+    )
+
+    second_artifact = await app_container.async_session.scalar(
+        select(ContentArtifact).where(ContentArtifact.crawl_url_id == second_seed_id)
+    )
+
+    assert second_artifact is None
+    assert committed_path.exists()
+
+
+@pytest.mark.anyio
 async def test_fetch_exception_persists_retry_attempt(
     app_container: CrawlTestContainer,
     monkeypatch: pytest.MonkeyPatch,
@@ -659,3 +714,67 @@ async def test_stale_claim_after_staging_cleans_up_staged_file(
     assert saved_files == []
     assert attempt is not None
     assert attempt.result_status == "in_progress"
+
+
+@pytest.mark.anyio
+async def test_abandoned_attempt_counts_toward_retry_exhaustion(
+    app_container: CrawlTestContainer,
+) -> None:
+    frozen_now = datetime(2026, 8, 20, 12, 0, 0)
+    parent_job = await app_container.async_session.get(CrawlJob, app_container.parent_job_id)
+    assert parent_job is not None
+    parent_job.config = {
+        "max_attempts": 2,
+        "base_backoff_seconds": 5,
+        "max_backoff_seconds": 60,
+        "child_rules": [],
+    }
+    seed_url = await app_container.async_session.get(CrawlUrl, app_container.seed_url_id)
+    assert seed_url is not None
+    seed_url.status = UrlStatus.FETCHING
+    seed_url.claimed_by = "dead-worker"
+    seed_url.claimed_at = frozen_now - timedelta(minutes=2)
+    seed_url.last_heartbeat_at = frozen_now - timedelta(minutes=2)
+    seed_url.lease_expires_at = frozen_now - timedelta(seconds=1)
+    app_container.async_session.add(
+        CrawlAttempt(
+            crawl_url_id=seed_url.id,
+            attempt_number=1,
+            started_at=frozen_now - timedelta(minutes=2),
+            result_status="in_progress",
+        )
+    )
+    app_container.fetch_response.update(
+        {"status_code": 500, "headers": {"Content-Type": "text/html"}, "body": ""}
+    )
+    await app_container.async_session.commit()
+
+    released = await app_container.url_repo.release_expired_leases(now=frozen_now)
+    reclaimed = await app_container.url_repo.claim_runnable_urls(worker_id="worker-a", limit=1)
+
+    await app_container.orchestrator.process_url(
+        url_id=app_container.seed_url_id,
+        worker_id="worker-a",
+    )
+
+    crawl_url = await app_container.async_session.get(CrawlUrl, app_container.seed_url_id)
+    attempts = list(
+        (
+            await app_container.async_session.scalars(
+                select(CrawlAttempt)
+                .where(CrawlAttempt.crawl_url_id == app_container.seed_url_id)
+                .order_by(CrawlAttempt.attempt_number)
+            )
+        ).all()
+    )
+
+    assert released == 1
+    assert len(reclaimed) == 1
+    assert crawl_url is not None
+    assert crawl_url.status is UrlStatus.FAILED_PERMANENT
+    assert crawl_url.error_code == "retry_exhausted"
+    assert crawl_url.fetch_attempts == 2
+    assert [attempt.result_status for attempt in attempts] == [
+        "abandoned",
+        UrlStatus.FAILED_PERMANENT.value,
+    ]

@@ -237,18 +237,29 @@ class UrlRepository:
         )
         released_ids = list(result.scalars().all())
         if released_ids:
-            await self._session.execute(
-                update(CrawlAttempt)
-                .where(
-                    CrawlAttempt.crawl_url_id.in_(released_ids),
-                    CrawlAttempt.finished_at.is_(None),
-                )
-                .values(
-                    finished_at=now,
-                    result_status="abandoned",
-                    error_detail="lease expired",
-                )
+            abandoned_attempt_url_ids = list(
+                (
+                    await self._session.execute(
+                        update(CrawlAttempt)
+                        .where(
+                            CrawlAttempt.crawl_url_id.in_(released_ids),
+                            CrawlAttempt.finished_at.is_(None),
+                        )
+                        .values(
+                            finished_at=now,
+                            result_status="abandoned",
+                            error_detail="lease expired",
+                        )
+                        .returning(CrawlAttempt.crawl_url_id)
+                    )
+                ).scalars().all()
             )
+            if abandoned_attempt_url_ids:
+                await self._session.execute(
+                    update(CrawlUrl)
+                    .where(CrawlUrl.id.in_(abandoned_attempt_url_ids))
+                    .values(fetch_attempts=CrawlUrl.fetch_attempts + 1)
+                )
         await self._session.flush()
         return len(released_ids)
 
