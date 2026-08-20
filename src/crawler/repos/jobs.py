@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from sqlalchemy import exists, select, update
+from sqlalchemy import exists, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -40,6 +41,9 @@ class JobRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def get(self, job_id: UUID) -> CrawlJob | None:
+        return await self._session.get(CrawlJob, job_id)
+
     async def create_job(
         self,
         *,
@@ -62,6 +66,50 @@ class JobRepository:
         self._session.add(job)
         await self._session.flush()
         return job
+
+    async def get_or_create_child_job(
+        self,
+        *,
+        parent_job_id: UUID,
+        seed_url: str,
+        seed_hostname: str,
+        inherited_config: dict[str, Any],
+    ) -> UUID:
+        normalized_seed_url = normalize_url(seed_url)
+        if urlsplit(normalized_seed_url).hostname != seed_hostname:
+            raise ValueError("child seed URL must use the parent seed hostname")
+
+        child_job_id = await self._find_child_job_id(parent_job_id, normalized_seed_url)
+        if child_job_id is not None:
+            return child_job_id
+
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": f"child-job:{parent_job_id}:{normalized_seed_url}"},
+        )
+        child_job_id = await self._find_child_job_id(parent_job_id, normalized_seed_url)
+        if child_job_id is not None:
+            return child_job_id
+
+        child = await self.create_job(
+            seed_url=normalized_seed_url,
+            config=deepcopy(inherited_config),
+            parent_job_id=parent_job_id,
+        )
+        return child.id
+
+    async def find_child_job(self, parent_job_id: UUID, seed_url: str) -> UUID | None:
+        return await self._find_child_job_id(parent_job_id, normalize_url(seed_url))
+
+    async def _find_child_job_id(
+        self, parent_job_id: UUID, normalized_seed_url: str
+    ) -> UUID | None:
+        return await self._session.scalar(
+            select(CrawlJob.id).where(
+                CrawlJob.parent_job_id == parent_job_id,
+                CrawlJob.seed_url == normalized_seed_url,
+            )
+        )
 
     async def request_pause(self, job_id: UUID) -> None:
         await self._session.execute(

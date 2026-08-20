@@ -117,6 +117,90 @@ class UrlRepository:
         await self._session.flush()
         return result.scalar_one_or_none() is not None
 
+    async def mark_fetching(self, *, url_id: UUID, worker_id: str) -> CrawlUrl:
+        result = await self._session.execute(
+            update(CrawlUrl)
+            .where(
+                CrawlUrl.id == url_id,
+                CrawlUrl.claimed_by == worker_id,
+                CrawlUrl.status == UrlStatus.CLAIMED,
+            )
+            .values(status=UrlStatus.FETCHING, started_at=_utcnow())
+            .returning(CrawlUrl)
+        )
+        await self._session.flush()
+        crawl_url = result.scalar_one_or_none()
+        if crawl_url is None:
+            raise RuntimeError("URL is not claimed by this worker")
+        return crawl_url
+
+    async def mark_processing(
+        self,
+        *,
+        url_id: UUID,
+        worker_id: str,
+        content_type: str,
+        http_status_code: int,
+    ) -> bool:
+        result = await self._session.execute(
+            update(CrawlUrl)
+            .where(
+                CrawlUrl.id == url_id,
+                CrawlUrl.claimed_by == worker_id,
+                CrawlUrl.status == UrlStatus.FETCHING,
+            )
+            .values(
+                status=UrlStatus.PROCESSING,
+                content_type=content_type,
+                http_status_code=http_status_code,
+            )
+            .returning(CrawlUrl.id)
+        )
+        await self._session.flush()
+        return result.scalar_one_or_none() is not None
+
+    async def mark_done(
+        self,
+        *,
+        url_id: UUID,
+        worker_id: str,
+        content_artifact_id: UUID,
+    ) -> bool:
+        result = await self._session.execute(
+            update(CrawlUrl)
+            .where(
+                CrawlUrl.id == url_id,
+                CrawlUrl.claimed_by == worker_id,
+                CrawlUrl.status == UrlStatus.PROCESSING,
+            )
+            .values(
+                status=UrlStatus.DONE,
+                content_artifact_id=content_artifact_id,
+                fetch_attempts=CrawlUrl.fetch_attempts + 1,
+                finished_at=_utcnow(),
+                claimed_by=None,
+                claimed_at=None,
+                lease_expires_at=None,
+                last_heartbeat_at=None,
+                error_code=None,
+                error_detail=None,
+            )
+            .returning(CrawlUrl.id)
+        )
+        await self._session.flush()
+        return result.scalar_one_or_none() is not None
+
+    async def exists_in_job(self, job_id: UUID, url: str) -> bool:
+        normalized_url = normalize_url(url)
+        return (
+            await self._session.scalar(
+                select(CrawlUrl.id).where(
+                    CrawlUrl.job_id == job_id,
+                    CrawlUrl.normalized_url == normalized_url,
+                )
+            )
+        ) is not None
+
     async def release_expired_leases(self, *, now: datetime) -> int:
         result = await self._session.execute(
             update(CrawlUrl)
@@ -146,6 +230,7 @@ class UrlRepository:
         next_eligible_at: datetime,
         error_code: str,
         error_detail: str,
+        http_status_code: int | None = None,
     ) -> bool:
         result = await self._session.execute(
             update(CrawlUrl)
@@ -158,6 +243,40 @@ class UrlRepository:
                 status=UrlStatus.RETRY_WAIT,
                 fetch_attempts=CrawlUrl.fetch_attempts + 1,
                 next_eligible_at=next_eligible_at,
+                http_status_code=http_status_code,
+                claimed_by=None,
+                claimed_at=None,
+                lease_expires_at=None,
+                last_heartbeat_at=None,
+                error_code=error_code,
+                error_detail=error_detail,
+            )
+            .returning(CrawlUrl.id)
+        )
+        await self._session.flush()
+        return result.scalar_one_or_none() is not None
+
+    async def mark_failed_permanent(
+        self,
+        *,
+        url_id: UUID,
+        worker_id: str,
+        error_code: str,
+        error_detail: str,
+        http_status_code: int | None,
+    ) -> bool:
+        result = await self._session.execute(
+            update(CrawlUrl)
+            .where(
+                CrawlUrl.id == url_id,
+                CrawlUrl.claimed_by == worker_id,
+                CrawlUrl.status.in_(ACTIVE_URL_STATUSES),
+            )
+            .values(
+                status=UrlStatus.FAILED_PERMANENT,
+                fetch_attempts=CrawlUrl.fetch_attempts + 1,
+                http_status_code=http_status_code,
+                finished_at=_utcnow(),
                 claimed_by=None,
                 claimed_at=None,
                 lease_expires_at=None,

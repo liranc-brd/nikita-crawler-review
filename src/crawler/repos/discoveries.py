@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from crawler.db.models.discoveries import DiscoveredLink
@@ -33,3 +34,10 @@ class DiscoveryRepository:
         self._session.add(discovery)
         await self._session.flush()
         return discovery
+
+    async def get_by_target(self, target_url: str) -> DiscoveredLink | None:
+        return await self._session.scalar(
+            select(DiscoveredLink).where(
+                DiscoveredLink.target_normalized_url == normalize_url(target_url)
+            )
+        )
